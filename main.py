@@ -16,4 +16,3 @@ def send_line(message):
     requests.post(url, headers=headers, json=data)
 
 send_line("GitHub Actions からのテスト送信です！")
-
