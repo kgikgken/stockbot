@@ -3,7 +3,7 @@ import os
 
 def send_line(message):
     token = os.getenv("LINE_TOKEN")
-    url = "https://api.line.me/v2/bot/message/push"
+    url = "https://api.line.me/v2/bot/message/broadcast"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
