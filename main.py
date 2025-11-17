@@ -9,15 +9,11 @@ def send_line(message):
         "Authorization": f"Bearer {token}"
     }
     data = {
-        "to": "YOUR_USER_ID",  # ←あとで書き換える
         "messages": [
             {"type": "text", "text": message}
         ]
     }
     requests.post(url, headers=headers, json=data)
 
-def main():
-    send_line("テストメッセージ：GitHub Actions から送信成功！")
+send_line("GitHub Actions からのテスト送信です！")
 
-if __name__ == "__main__":
-    main()
