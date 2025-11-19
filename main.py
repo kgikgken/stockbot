@@ -4,10 +4,15 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+
+
+# =========================
+# 設定まわり
+# =========================
 
 # 🔧 スクリーニング対象の日本株（簡易ユニバース）
-# 必要に応じて銘柄を増やしていけるようにしてある
-UNIVERSE = {
+UNIVERSE: Dict[str, List[str]] = {
     "半導体・電子部品": [
         "8035.T",  # 東京エレクトロン
         "6920.T",  # レーザーテック
@@ -30,9 +35,42 @@ UNIVERSE = {
     ],
 }
 
+# ロジック用パラメータ（あとで好みでチューニングしやすいように）
+PULLBACK_MA_TOL = 0.03        # 5/10MAから±3％以内を「押し目ゾーン」とする
+PULLBACK_LOOKBACK = 3         # 直近3本のローソク足で押し目判定
+PULLBACK_NEG_COUNT = 2        # 3本中2本以上の陰線 など
+MIN_HISTORY_DAYS = 30         # 最低このくらいデータがないと判定しない
 
-def fetch_history(ticker: str, period: str = "3mo") -> pd.DataFrame | None:
-    """yfinance から過去データ取得（60営業日分に絞る）"""
+
+# =========================
+# 共通ユーティリティ
+# =========================
+
+def jst_now() -> datetime:
+    """JST の現在時刻を返す"""
+    return datetime.now(timezone(timedelta(hours=9)))
+
+
+def safe_float(x) -> float:
+    """NaN や Series が来ても落ちないように float へ変換"""
+    if isinstance(x, pd.Series):
+        # Series の場合は最後の要素を使う
+        x = x.iloc[-1]
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
+
+
+# =========================
+# データ取得＆加工
+# =========================
+
+def fetch_history(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
+    """
+    yfinance から過去データ取得（最大60営業日分）。
+    失敗時は None を返す。
+    """
     try:
         df = yf.download(
             ticker,
@@ -41,52 +79,86 @@ def fetch_history(ticker: str, period: str = "3mo") -> pd.DataFrame | None:
             auto_adjust=False,
             progress=False,
         )
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] {ticker} ダウンロード失敗: {e}")
         return None
 
     if df is None or df.empty:
+        print(f"[WARN] {ticker} データなし")
         return None
 
+    # 直近60本に絞る
     df = df.tail(60).copy()
-    df["close"] = df["Close"]
+
+    # 必要な列が無ければスキップ
+    if "Close" not in df.columns:
+        print(f"[WARN] {ticker} Close列が存在しません")
+        return None
+
+    df["close"] = df["Close"].astype(float)
     df["ret_1d"] = df["close"].pct_change()
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma25"] = df["close"].rolling(25).mean()
+
     return df
 
 
+# =========================
+# セクター強度計算
+# =========================
+
 def calc_sector_strength() -> pd.DataFrame:
-    """セクターごとの1日・5日騰落率と25日線の傾きを計算"""
+    """
+    セクターごとの1日・5日騰落率と25日線の傾きを計算。
+    すべて float に落としておき、ambiguous エラーを完全に回避。
+    """
     records = []
+
     for sector, tickers in UNIVERSE.items():
         vals = []
         for t in tickers:
             df = fetch_history(t)
             if df is None or len(df) < 25:
                 continue
-            last = df.iloc[-1]
-            # 5営業日前との比較（最低6本は欲しい）
-            if len(df) >= 6:
-                base = df.iloc[-6]
-            else:
-                base = df.iloc[0]
-            ret_5d = (last["close"] / base["close"] - 1) * 100
-            ret_1d = last["ret_1d"] * 100
 
-            ma25_now = last["ma25"]
-            ma25_prev = df["ma25"].iloc[-6] if len(df) >= 6 else np.nan
-            if pd.notna(ma25_now) and pd.notna(ma25_prev) and ma25_prev != 0:
+            last = df.iloc[-1]
+
+            # 終値
+            close_now = safe_float(last["close"])
+
+            # 5営業日前（なければ最初）との比較
+            if len(df) >= 6:
+                base_close = safe_float(df["close"].iloc[-6])
+                ma25_prev_raw = df["ma25"].iloc[-6]
+            else:
+                base_close = safe_float(df["close"].iloc[0])
+                ma25_prev_raw = df["ma25"].iloc[0]
+
+            if base_close <= 0:
+                continue
+
+            # 1日・5日リターン
+            ret_1d = safe_float(last["ret_1d"]) * 100
+            ret_5d = (close_now / base_close - 1) * 100
+
+            # 25日線の傾き
+            ma25_now = safe_float(last["ma25"])
+            ma25_prev = safe_float(ma25_prev_raw)
+            if np.isfinite(ma25_now) and np.isfinite(ma25_prev) and ma25_prev != 0:
                 slope25 = (ma25_now - ma25_prev) / ma25_prev * 100
             else:
                 slope25 = 0.0
+
+            if not np.isfinite(ret_1d) or not np.isfinite(ret_5d):
+                continue
 
             vals.append((ret_1d, ret_5d, slope25))
 
         if not vals:
             continue
 
-        arr = np.array(vals)
+        arr = np.array(vals, dtype=float)
         records.append(
             {
                 "sector": sector,
@@ -102,53 +174,100 @@ def calc_sector_strength() -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+# =========================
+# 押し目判定ロジック
+# =========================
+
 def is_pullback(df: pd.DataFrame) -> bool:
-    """押し目判定ロジック（シンプル版）"""
+    """
+    押し目判定ロジック（シンプルだけど壊れにくい版）
+
+    条件：
+      1. 25日線の上にいる
+      2. 25日線が5営業日前より上（上向き）
+      3. 5日 or 10日線付近（±3％以内）
+      4. 直近3本のローソク足で、陰線が多い or もみ合い
+    """
+    if df is None or len(df) < MIN_HISTORY_DAYS:
+        return False
+
     last = df.iloc[-1]
 
-    # 25日線の上にいるか
-    if pd.isna(last["ma25"]) or last["close"] < last["ma25"]:
+    close_now = safe_float(last["close"])
+    ma5_now = safe_float(last["ma5"])
+    ma10_now = safe_float(last["ma10"])
+    ma25_now = safe_float(last["ma25"])
+
+    if not np.isfinite(close_now) or not np.isfinite(ma25_now):
         return False
 
-    # 25日線が上向き（5営業日前より上）
-    if len(df) < 30 or pd.isna(df["ma25"].iloc[-6]):
-        return False
-    if last["ma25"] <= df["ma25"].iloc[-6]:
+    # 1. 25日線の上
+    if close_now < ma25_now:
         return False
 
-    # 5日 or 10日線付近（±3％以内）
-    cond_ma5 = pd.notna(last["ma5"]) and abs(last["close"] - last["ma5"]) / last["ma5"] <= 0.03
-    cond_ma10 = pd.notna(last["ma10"]) and abs(last["close"] - last["ma10"]) / last["ma10"] <= 0.03
+    # 2. 25日線が上向き（5営業日前より上）
+    if len(df) < 30:
+        return False
+
+    ma25_prev = safe_float(df["ma25"].iloc[-6])
+    if not np.isfinite(ma25_prev):
+        return False
+    if ma25_now <= ma25_prev:
+        return False
+
+    # 3. 5日 or 10日線付近（±3％以内）
+    cond_ma5 = np.isfinite(ma5_now) and abs(close_now - ma5_now) / ma5_now <= PULLBACK_MA_TOL
+    cond_ma10 = np.isfinite(ma10_now) and abs(close_now - ma10_now) / ma10_now <= PULLBACK_MA_TOL
     if not (cond_ma5 or cond_ma10):
         return False
 
-    # 直近3本のローソク足（終値ベース）の動き：2本以上陰線など
-    recent = df["ret_1d"].tail(3)
+    # 4. 直近3本の終値リターン
+    recent = df["ret_1d"].tail(PULLBACK_LOOKBACK).dropna()
+    if len(recent) < 2:
+        return False
+
     negatives = (recent < 0).sum()
-    last_ret = recent.iloc[-1]
-    if not (negatives >= 2 or (negatives >= 1 and abs(last_ret) < 0.01)):
+    last_ret = float(recent.iloc[-1])
+
+    if not (negatives >= PULLBACK_NEG_COUNT or (negatives >= 1 and abs(last_ret) < 0.01)):
         return False
 
     return True
 
 
-def pick_candidates(strong_sectors: list[str], per_sector: int = 3) -> pd.DataFrame:
-    """強いセクターの中から押し目候補を抽出"""
+# =========================
+# 候補銘柄の抽出
+# =========================
+
+def pick_candidates(strong_sectors: List[str], per_sector: int = 3) -> pd.DataFrame:
+    """
+    強いセクターの中から押し目候補を抽出。
+    戻り値が空の DataFrame のときは候補なし。
+    """
     rows = []
+
     for sector in strong_sectors:
         for ticker in UNIVERSE.get(sector, []):
             df = fetch_history(ticker)
-            if df is None or len(df) < 25:
+            if df is None or len(df) < MIN_HISTORY_DAYS:
                 continue
+
             if not is_pullback(df):
                 continue
+
             last = df.iloc[-1]
+            price = safe_float(last["close"])
+            chg_1d = safe_float(last["ret_1d"]) * 100
+
+            if not np.isfinite(price) or not np.isfinite(chg_1d):
+                continue
+
             rows.append(
                 {
                     "sector": sector,
                     "ticker": ticker,
-                    "price": float(last["close"]),
-                    "chg_1d": float(last["ret_1d"] * 100),
+                    "price": price,
+                    "chg_1d": chg_1d,
                 }
             )
 
@@ -156,21 +275,28 @@ def pick_candidates(strong_sectors: list[str], per_sector: int = 3) -> pd.DataFr
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    # 押しているもの優先でソート（1日リターンが小さい順）
+    # 押しているもの優先（1日リターンの小さい順）
     df = df.sort_values(["sector", "chg_1d"])
 
     # セクターごとに最大 per_sector 銘柄に絞る
     out = []
     for sector, grp in df.groupby("sector"):
         out.append(grp.head(per_sector))
+
     return pd.concat(out)
 
 
+# =========================
+# メッセージ生成
+# =========================
+
 def build_message() -> str:
-    """LINEで送るテキストを組み立てる"""
+    """LINEで送るテキストを組み立てる（ここで絶対に例外を外へ投げない）"""
+    # 1. セクター強度
     try:
         sec_df = calc_sector_strength()
     except Exception as e:
+        print("[ERROR] calc_sector_strength failed:", e)
         return f"スクリーニング中にエラーが発生しました: {e}"
 
     if sec_df.empty:
@@ -178,23 +304,26 @@ def build_message() -> str:
 
     # 5日騰落率の強い順に並べてTOP3
     sec_df = sec_df.sort_values("avg_5d", ascending=False)
-    top = sec_df.head(3)
+    top = sec_df.head(3).reset_index(drop=True)
     strong_sectors = list(top["sector"])
 
-    # 押し目候補抽出
+    # 2. 押し目候補
     try:
         cands = pick_candidates(strong_sectors)
     except Exception as e:
+        print("[ERROR] pick_candidates failed:", e)
         cands = None
 
-    jst = datetime.now(timezone(timedelta(hours=9)))
-    lines: list[str] = []
-    lines.append(f"📈 {jst:%Y-%m-%d} スイング候補レポート")
+    now = jst_now()
+
+    lines: List[str] = []
+    lines.append(f"📈 {now:%Y-%m-%d} スイング候補レポート")
     lines.append("")
     lines.append("【強いセクター TOP3（5日騰落率ベース）】")
     for _, r in top.iterrows():
         lines.append(
-            f"- {r['sector']}: 1日 {r['avg_1d']:.1f}% / 5日 {r['avg_5d']:.1f}% / 25日線傾き {r['avg_slope25']:.2f}%"
+            f"- {r['sector']}: 1日 {r['avg_1d']:.1f}% / 5日 {r['avg_5d']:.1f}% / "
+            f"25日線傾き {r['avg_slope25']:.2f}%"
         )
 
     lines.append("")
@@ -212,11 +341,15 @@ def build_message() -> str:
     return "\n".join(lines)
 
 
+# =========================
+# LINE 送信まわり
+# =========================
+
 def send_line(message: str) -> None:
-    """LINE にテキストメッセージを送る"""
+    """LINE にテキストメッセージを送る（Broadcast）"""
     token = os.getenv("LINE_TOKEN")
     if not token:
-        print("LINE_TOKEN が設定されていません。")
+        print("[ERROR] LINE_TOKEN が設定されていません。")
         return
 
     url = "https://api.line.me/v2/bot/message/broadcast"
@@ -225,18 +358,23 @@ def send_line(message: str) -> None:
         "Authorization": f"Bearer {token}",
     }
     data = {
-        "messages": [
-            {"type": "text", "text": message}
-        ]
+        "messages": [{"type": "text", "text": message}]
     }
+
     try:
         resp = requests.post(url, headers=headers, json=data, timeout=10)
-        print("LINE API status:", resp.status_code, resp.text)
+        print("LINE API status:", resp.status_code)
+        if resp.status_code != 200:
+            print("LINE API response body:", resp.text)
     except Exception as e:
-        print("LINE送信中にエラー:", e)
+        print("[ERROR] LINE送信中にエラー:", e)
 
 
-def main():
+# =========================
+# エントリポイント
+# =========================
+
+def main() -> None:
     msg = build_message()
     send_line(msg)
 
