@@ -26,6 +26,9 @@ WEIGHT_RSI = 0.5
 WEIGHT_MA25 = 0.3
 WEIGHT_VOLUME = 0.2
 
+# LINE 1メッセージの安全上限（公式は5000文字だが余裕を持たせる）
+MAX_LINE_TEXT_LEN = 3900
+
 
 # =============================
 # ユーティリティ
@@ -43,6 +46,8 @@ def safe_float(x) -> float:
         return float(x)
     except Exception:
         return float("nan")
+
+
 # =============================
 # ユニバース読み込み
 # =============================
@@ -95,10 +100,14 @@ def fetch_history(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
     """
     try:
         df = yf.download(
-            ticker, period=period, interval="1d",
-            auto_adjust=False, progress=False
+            ticker,
+            period=period,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
         )
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] yfinance ダウンロード失敗: {ticker} / {e}")
         return None
 
     if df is None or df.empty or "Close" not in df.columns:
@@ -114,6 +123,8 @@ def fetch_history(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
     df = add_rsi(df)
 
     return df
+
+
 # =============================
 # セクター強度計算
 # =============================
@@ -162,12 +173,14 @@ def calc_sector_strength() -> pd.DataFrame:
             continue
 
         arr = np.array(vals, dtype=float)
-        records.append({
-            "sector": sector,
-            "avg_1d": float(arr[:, 0].mean()),
-            "avg_5d": float(arr[:, 1].mean()),
-            "avg_slope25": float(arr[:, 2].mean())
-        })
+        records.append(
+            {
+                "sector": sector,
+                "avg_1d": float(arr[:, 0].mean()),
+                "avg_5d": float(arr[:, 1].mean()),
+                "avg_slope25": float(arr[:, 2].mean()),
+            }
+        )
 
     return pd.DataFrame(records)
 
@@ -191,19 +204,15 @@ def volume_pattern_ok(df: pd.DataFrame) -> bool:
     if len(vol) < 20:
         return False
 
-    # ぜんぶ「float」にして、Series を残さない
+    # float にして Series のあいまい判定をなくす
     avg20 = float(vol.tail(20).mean())
     avg5 = float(vol.tail(5).mean())
     avg2 = float(vol.tail(2).mean())
 
-    # 減少 → 増加転換
-    cond_decrease = avg5 < avg20     # 減少
-    cond_increase = avg2 > avg5      # 増加
+    cond_decrease = avg5 < avg20   # 減少
+    cond_increase = avg2 > avg5    # 増加
 
-    # cond_* はどちらもふつうの bool なので、ここであいまいさは発生しない
-    return cond_decrease and cond_increase
-
-
+    return bool(cond_decrease and cond_increase)
 
 
 # =============================
@@ -279,21 +288,26 @@ def pick_candidates_in_sector(strong_sectors: List[str]) -> pd.DataFrame:
 
         ma5 = safe_float(last["ma5"])
         ma10 = safe_float(last["ma10"])
-        buy_lower = min([v for v in [ma5, ma10, price] if np.isfinite(v)])
-        buy_upper = max([v for v in [ma5, ma10, price] if np.isfinite(v)])
+        valid_vals = [v for v in [ma5, ma10, price] if np.isfinite(v)]
+        buy_lower = min(valid_vals) if valid_vals else price
+        buy_upper = max(valid_vals) if valid_vals else price
 
-        rows.append({
-            "ticker": ticker,
-            "name": name,
-            "sector": sector,
-            "price": price,
-            "chg_1d": chg_1d,
-            "rsi": rsi,
-            "buy_lower": buy_lower,
-            "buy_upper": buy_upper
-        })
+        rows.append(
+            {
+                "ticker": ticker,
+                "name": name,
+                "sector": sector,
+                "price": price,
+                "chg_1d": chg_1d,
+                "rsi": rsi,
+                "buy_lower": buy_lower,
+                "buy_upper": buy_upper,
+            }
+        )
 
     return pd.DataFrame(rows)
+
+
 # =============================
 # セクター外の押し目候補（ACDE複合スコア）
 # =============================
@@ -322,8 +336,9 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
         # 5MA・10MAから買いレンジ
         ma5 = safe_float(last["ma5"])
         ma10 = safe_float(last["ma10"])
-        buy_lower = min([v for v in [ma5, ma10, price] if np.isfinite(v)])
-        buy_upper = max([v for v in [ma5, ma10, price] if np.isfinite(v)])
+        valid_vals = [v for v in [ma5, ma10, price] if np.isfinite(v)]
+        buy_lower = min(valid_vals) if valid_vals else price
+        buy_upper = max(valid_vals) if valid_vals else price
 
         # MA25乖離
         ma25 = safe_float(last["ma25"])
@@ -342,22 +357,24 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
 
         # ACDEスコア（低い順が強い押し目）
         score = (
-            (rsi if np.isfinite(rsi) else 100) * WEIGHT_RSI +
-            (ma25_dis if np.isfinite(ma25_dis) else 1.0) * WEIGHT_MA25 +
-            (-vol_score) * WEIGHT_VOLUME  # 出来高増加は良いのでマイナス
+            (rsi if np.isfinite(rsi) else 100.0) * WEIGHT_RSI
+            + (ma25_dis if np.isfinite(ma25_dis) else 1.0) * WEIGHT_MA25
+            + (-vol_score) * WEIGHT_VOLUME  # 出来高増加は良いのでマイナス
         )
 
-        rows.append({
-            "ticker": ticker,
-            "name": name,
-            "sector": sector,
-            "price": price,
-            "chg_1d": chg_1d,
-            "rsi": rsi,
-            "buy_lower": buy_lower,
-            "buy_upper": buy_upper,
-            "score": score
-        })
+        rows.append(
+            {
+                "ticker": ticker,
+                "name": name,
+                "sector": sector,
+                "price": price,
+                "chg_1d": chg_1d,
+                "rsi": rsi,
+                "buy_lower": buy_lower,
+                "buy_upper": buy_upper,
+                "score": score,
+            }
+        )
 
     if not rows:
         return pd.DataFrame()
@@ -385,7 +402,7 @@ def build_message() -> str:
     strong_sectors = list(top["sector"])
 
     now = jst_now()
-    lines = []
+    lines: List[str] = []
     lines.append(f"📈 {now:%Y-%m-%d} スイング候補レポート\n")
 
     # --- TOP5セクター ---
@@ -450,10 +467,31 @@ def build_message() -> str:
 # LINE送信
 # =============================
 
+def _split_message(text: str, limit: int = MAX_LINE_TEXT_LEN) -> List[str]:
+    """LINEの文字数制限に引っかからないようにメッセージを分割"""
+    if len(text) <= limit:
+        return [text]
+
+    parts: List[str] = []
+    current = ""
+
+    for line in text.split("\n"):
+        # +1 は改行分
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current.rstrip())
+            current = ""
+        current += line + "\n"
+
+    if current.strip():
+        parts.append(current.rstrip())
+
+    return parts
+
+
 def send_line(message: str) -> None:
     token = os.getenv("LINE_TOKEN")
     if not token:
-        print("[ERROR] LINE_TOKEN がありません")
+        print("[ERROR] LINE_TOKEN が設定されていません")
         return
 
     url = "https://api.line.me/v2/bot/message/broadcast"
@@ -461,23 +499,35 @@ def send_line(message: str) -> None:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
-    data = {"messages": [{"type": "text", "text": message}]}
 
-    try:
-        resp = requests.post(url, headers=headers, json=data, timeout=10)
-        print("LINE API:", resp.status_code)
-        if resp.status_code != 200:
-            print("Response:", resp.text)
-    except Exception as e:
-        print("[ERROR] LINE送信失敗:", e)
+    chunks = _split_message(message)
+
+    for i in range(0, len(chunks), 5):  # 1リクエスト最大5メッセージ
+        batch = chunks[i : i + 5]
+        data = {"messages": [{"type": "text", "text": t} for t in batch]}
+
+        try:
+            resp = requests.post(url, headers=headers, json=data, timeout=10)
+            print(f"[INFO] LINE API status: {resp.status_code}")
+            if resp.status_code != 200:
+                print("[ERROR] LINE API response:", resp.text)
+        except Exception as e:
+            print("[ERROR] LINE送信中に例外が発生:", e)
 
 
 # =============================
 # main()
 # =============================
 
-def main():
-    msg = build_message()
+def main() -> None:
+    try:
+        msg = build_message()
+    except Exception as e:
+        # ここで落ちても、エラー内容をLINEに送る
+        error_msg = f"スクリーニング中にエラーが発生しました: {e}"
+        print("[ERROR] build_message 失敗:", e)
+        msg = error_msg
+
     send_line(msg)
 
 
