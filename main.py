@@ -178,32 +178,31 @@ def calc_sector_strength() -> pd.DataFrame:
 
 def volume_pattern_ok(df: pd.DataFrame) -> bool:
     """
-    出来高の「減少 → 増加」パターンを判定
-    ・直近5日間の出来高平均が、過去20日平均より低い → 減少局面
-    ・直近2日間の出来高平均が、直近5日平均より高い → 増加転換
+    出来高の「減少 → 増加」パターンを判定する。
+    ・直近20日平均より直近5日平均の方が小さい → 減少局面
+    ・直近5日平均より直近2日平均の方が大きい → 増加転換
     """
     if "Volume" not in df.columns:
         return False
 
     vol = df["Volume"].fillna(0)
 
+    # データが少なすぎる場合は判定しない
     if len(vol) < 20:
         return False
 
-    # 過去20日平均
-    avg20 = vol.tail(20).mean()
+    # ぜんぶ「float」にして、Series を残さない
+    avg20 = float(vol.tail(20).mean())
+    avg5 = float(vol.tail(5).mean())
+    avg2 = float(vol.tail(2).mean())
 
-    # 直近5日平均
-    avg5 = vol.tail(5).mean()
+    # 減少 → 増加転換
+    cond_decrease = avg5 < avg20     # 減少
+    cond_increase = avg2 > avg5      # 増加
 
-    # 直近2日平均
-    avg2 = vol.tail(2).mean()
+    # cond_* はどちらもふつうの bool なので、ここであいまいさは発生しない
+    return cond_decrease and cond_increase
 
-    # 減少 → 増加転換を判定
-    cond_decrease = avg5 < avg20
-    cond_increase = avg2 > avg5
-
-    return bool(cond_decrease and cond_increase)
 
 
 
