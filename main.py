@@ -393,6 +393,37 @@ def is_pullback(df: pd.DataFrame) -> bool:
 
 
 # =============================
+# ACDEスコア計算（銘柄単位）
+# =============================
+
+def compute_acde_score(df: pd.DataFrame, last: pd.Series) -> float:
+    price = safe_float(last.get("close"))
+    rsi = safe_float(last.get("rsi", np.nan))
+    ma25 = safe_float(last.get("ma25", np.nan))
+
+    # MA25乖離
+    if ma25 > 0:
+        ma25_dis = abs(price - ma25) / ma25
+    else:
+        ma25_dis = 1.0
+
+    # 出来高転換スコア = 今日出来高 / 最近5日平均
+    vol = df["Volume"].dropna()
+    if len(vol) >= 6:
+        recent5 = vol.tail(6).iloc[:-1]
+        vol_score = safe_float(vol.iloc[-1] / recent5.mean())
+    else:
+        vol_score = 1.0
+
+    score = (
+        (rsi if np.isfinite(rsi) else 100.0) * WEIGHT_RSI
+        + (ma25_dis if np.isfinite(ma25_dis) else 1.0) * WEIGHT_MA25
+        + (-vol_score) * WEIGHT_VOLUME  # 出来高増加は良いのでマイナス
+    )
+    return float(score)
+
+
+# =============================
 # 買いレンジ計算（精密・下限寄り）
 # =============================
 
@@ -574,38 +605,6 @@ def describe_market_score(score: float) -> str:
 
 
 # =============================
-# ヒートマップ用ヘルパー
-# =============================
-
-def _sector_heat_emoji(ret_5d: float) -> str:
-    """5日騰落率からセクターヒートマップ用の色を決める"""
-    if ret_5d >= 2.0:
-        return "🟩"  # 強い上昇
-    elif ret_5d >= 0.5:
-        return "🟨"  # やや上昇
-    elif ret_5d >= -0.5:
-        return "🟦"  # 横ばい〜小動き
-    elif ret_5d >= -2.0:
-        return "🟧"  # やや下落
-    else:
-        return "🟥"  # 下落
-
-
-def _stock_heat_emoji(chg_1d: float) -> str:
-    """日中変化率から銘柄ヒートマップ用の色を決める"""
-    if chg_1d >= 3.0:
-        return "🟩"
-    elif chg_1d >= 1.0:
-        return "🟨"
-    elif chg_1d >= -1.0:
-        return "🟦"
-    elif chg_1d >= -3.0:
-        return "🟧"
-    else:
-        return "🟥"
-
-
-# =============================
 # 候補抽出
 # =============================
 
@@ -626,8 +625,10 @@ def pick_candidates_in_sector(strong_sectors: List[str]) -> pd.DataFrame:
         price = safe_float(last["close"])
         chg_1d = safe_float(last["ret_1d"]) * 100
         rsi = safe_float(last.get("rsi"))
+        ma25 = safe_float(last.get("ma25"))
 
         buy_lower, buy_upper = calc_buy_range(df)
+        score = compute_acde_score(df, last)
 
         rows.append(
             {
@@ -637,8 +638,10 @@ def pick_candidates_in_sector(strong_sectors: List[str]) -> pd.DataFrame:
                 "price": price,
                 "chg_1d": chg_1d,
                 "rsi": rsi,
+                "ma25": ma25,
                 "buy_lower": buy_lower,
                 "buy_upper": buy_upper,
+                "score": score,
             }
         )
 
@@ -663,27 +666,10 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
         price = safe_float(last["close"])
         chg_1d = safe_float(last["ret_1d"]) * 100
         rsi = safe_float(last.get("rsi"))
+        ma25 = safe_float(last.get("ma25"))
 
         buy_lower, buy_upper = calc_buy_range(df)
-
-        ma25 = safe_float(last["ma25"])
-        if ma25 > 0:
-            ma25_dis = abs(price - ma25) / ma25
-        else:
-            ma25_dis = np.nan
-
-        vol = df["Volume"].dropna()
-        if len(vol) >= 6:
-            recent5 = vol.tail(6).iloc[:-1]
-            vol_score = safe_float(vol.iloc[-1] / recent5.mean())
-        else:
-            vol_score = 1.0
-
-        score = (
-            (rsi if np.isfinite(rsi) else 100.0) * WEIGHT_RSI
-            + (ma25_dis if np.isfinite(ma25_dis) else 1.0) * WEIGHT_MA25
-            + (-vol_score) * WEIGHT_VOLUME
-        )
+        score = compute_acde_score(df, last)
 
         rows.append(
             {
@@ -693,6 +679,7 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
                 "price": price,
                 "chg_1d": chg_1d,
                 "rsi": rsi,
+                "ma25": ma25,
                 "buy_lower": buy_lower,
                 "buy_upper": buy_upper,
                 "score": score,
@@ -732,12 +719,84 @@ def _format_candidates_table(df: pd.DataFrame) -> List[str]:
 
 
 # =============================
+# 理由生成ロジック
+# =============================
+
+def build_reason_for_row(row: pd.Series,
+                         sector_row: Optional[pd.Series],
+                         overall_market_desc: str) -> str:
+    reasons: List[str] = []
+
+    # RSI 状態
+    rsi = safe_float(row.get("rsi", np.nan))
+    if np.isfinite(rsi):
+        if rsi < 35:
+            reasons.append(f"RSI{rsi:.0f}で売られ気味の押し目")
+        elif rsi < 55:
+            reasons.append(f"RSI{rsi:.0f}で中立〜やや強め")
+        else:
+            reasons.append(f"RSI{rsi:.0f}でトレンド継続中の押し目")
+
+    # 25日線との位置
+    price = safe_float(row.get("price", np.nan))
+    ma25 = safe_float(row.get("ma25", np.nan))
+    if np.isfinite(price) and np.isfinite(ma25) and ma25 > 0:
+        diff_pct = abs(price - ma25) / ma25 * 100
+        if diff_pct < 1.0:
+            reasons.append("25日移動平均線タッチ付近")
+        elif diff_pct < 2.0:
+            reasons.append("25日線近辺の押し目")
+
+    # 出来高パターン（is_pullback を通っているので全銘柄共通だが、明示的に書く）
+    reasons.append("出来高が減少から増加に転換")
+
+    # セクター材料
+    if sector_row is not None:
+        material = str(sector_row.get("material", "")).strip()
+        if material:
+            reasons.append(f"セクター材料: {material}")
+
+        # 地合いとの相対強弱
+        avg_5d = safe_float(sector_row.get("avg_5d", np.nan))
+        if overall_market_desc in ["弱気", "かなり弱気"] and avg_5d > 0:
+            reasons.append("地合い弱い中で相対的に強いセクター")
+
+    # 1日の値動き
+    chg_1d = safe_float(row.get("chg_1d", np.nan))
+    if np.isfinite(chg_1d):
+        if chg_1d < -2.0:
+            reasons.append("当日大きめの押しが入っている")
+        elif chg_1d < 0:
+            reasons.append("当日調整の押し目")
+
+    # ダブりを避けて3つ程度にまとめる
+    unique_reasons = []
+    for r in reasons:
+        if r not in unique_reasons:
+            unique_reasons.append(r)
+        if len(unique_reasons) >= 3:
+            break
+
+    return " / ".join(unique_reasons)
+
+
+# =============================
 # メッセージ生成
 # =============================
 
 def build_message() -> str:
     # 地合い
     market = calc_market_regime()
+
+    overall_desc = "中立"
+    if market:
+        total_score = 0.0
+        n = 0
+        for vals in market.values():
+            total_score += vals["score"]
+            n += 1
+        if n:
+            overall_desc = describe_market_score(total_score / n)
 
     # セクター強度
     sec_df = calc_sector_strength()
@@ -748,6 +807,11 @@ def build_message() -> str:
     top = sec_df.head(TOP_SECTOR_COUNT).reset_index(drop=True)
     strong_sectors = list(top["sector"])
 
+    # セクター情報を辞書化（理由生成やランキング用）
+    sector_info_map: Dict[str, pd.Series] = {
+        str(r["sector"]): r for _, r in sec_df.iterrows()
+    }
+
     now = jst_now()
     lines: List[str] = []
     lines.append(f"📈 {now:%Y-%m-%d} スイング候補レポート\n")
@@ -755,19 +819,13 @@ def build_message() -> str:
     # --- 相場地合いスコア ---
     if market:
         lines.append("【相場地合いスコア】")
-        total = 0.0
-        n = 0
         for name, vals in market.items():
             desc = describe_market_score(vals["score"])
             lines.append(
                 f"- {name}: 1日 {vals['ret_1d']:.1f}% / 5日 {vals['ret_5d']:.1f}% / "
                 f"25日線傾き {vals['slope25']:.2f}% → {desc}"
             )
-            total += vals["score"]
-            n += 1
-        if n:
-            overall = describe_market_score(total / n)
-            lines.append(f"⇒ 地合い総合評価: {overall}\n")
+        lines.append(f"⇒ 地合い総合評価: {overall_desc}\n")
 
     # --- セクター強度 ---
     lines.append("【今日のテーマ候補（セクターベース）】")
@@ -789,12 +847,6 @@ def build_message() -> str:
             f"5日 {r['avg_5d']:.1f}% / 25日線傾き {r['avg_slope25']:.2f}% / "
             f"ニュース {r['news_score']:.2f} {comment}"
         )
-
-    # --- セクターヒートマップ ---
-    lines.append("\n【セクターヒートマップ（5日騰落率）】")
-    for _, r in sec_df.iterrows():
-        emoji = _sector_heat_emoji(r["avg_5d"])
-        lines.append(f"{emoji} {r['sector']}: {r['avg_5d']:.1f}%")
 
     # --- 主な材料トピック ---
     lines.append("\n【主な材料トピック（上位セクター）】")
@@ -825,26 +877,47 @@ def build_message() -> str:
             lines.append(f"▼{sector}")
             lines.extend(_format_candidates_table(grp))
 
-    # --- 候補銘柄ヒートマップ ---
-    if not cands_in.empty or not cands_out.empty:
-        lines.append("\n【候補銘柄ヒートマップ（日中変化率）】")
-        try:
-            df_all = []
-            if not cands_in.empty:
-                df_all.append(cands_in[["ticker", "name", "chg_1d"]].copy())
-            if not cands_out.empty:
-                df_all.append(cands_out[["ticker", "name", "chg_1d"]].copy())
-            all_df = pd.concat(df_all, ignore_index=True)
+    # --- 今日の注目ランキング（本当にIN候補） ---
+    all_list = []
+    if not cands_in.empty:
+        all_list.append(cands_in)
+    if not cands_out.empty:
+        all_list.append(cands_out)
 
-            # 多すぎると見づらいので上位30銘柄まで
-            for _, r in all_df.head(30).iterrows():
-                chg = safe_float(r["chg_1d"])
-                emoji = _stock_heat_emoji(chg)
-                lines.append(
-                    f"{emoji} {r['ticker']}（{r['name']}）: {chg:.1f}%"
-                )
-        except Exception as e:
-            print("[WARN] ヒートマップ生成中にエラー:", e)
+    if all_list:
+        all_df = pd.concat(all_list, ignore_index=True)
+
+        # セクター強度スコアを付与
+        def _get_sector_total(s: str) -> float:
+            info = sector_info_map.get(str(s))
+            if info is None:
+                return 0.0
+            return safe_float(info.get("total_score", 0.0))
+
+        all_df["sector_total"] = all_df["sector"].map(_get_sector_total)
+
+        # ランキングスコア（ACDEスコアが低いほど良いのでマイナス）
+        all_df["rank_score"] = -all_df["score"] + all_df["sector_total"] * 0.5
+        all_df = all_df.sort_values("rank_score", ascending=False)
+
+        # 10〜20銘柄に絞る
+        total_candidates = len(all_df)
+        if total_candidates <= 10:
+            n_pick = total_candidates
+        else:
+            n_pick = min(20, total_candidates)
+        top_rank = all_df.head(n_pick)
+
+        lines.append("\n【今日の注目ランキング（本当にIN候補）】")
+        rank = 1
+        for _, r in top_rank.iterrows():
+            sec = str(r["sector"])
+            sec_row = sector_info_map.get(sec)
+            reason = build_reason_for_row(r, sec_row, overall_desc)
+            lines.append(
+                f"{rank}. {r['ticker']}（{r['name']}） | {int(safe_float(r['price']))}円 | {reason}"
+            )
+            rank += 1
 
     return "\n".join(lines)
 
