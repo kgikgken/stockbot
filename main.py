@@ -4,7 +4,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
 
 UNIVERSE_CSV_PATH = "universe_jpx.csv"
 
@@ -68,14 +67,22 @@ def fetch_history(ticker):
 
 def volume_ok(df):
     vol = df["Volume"].fillna(0)
+
     if len(vol) < 20:
         return False
-    if vol.iloc[-1] < MIN_VOLUME:
+
+    last_vol = float(vol.iloc[-1])
+    if last_vol < MIN_VOLUME:
         return False
-    avg20 = vol.tail(20).mean()
-    avg5 = vol.tail(5).mean()
-    avg2 = vol.tail(2).mean()
-    return (avg5 < avg20) and (avg2 > avg5)
+
+    avg20 = float(vol.tail(20).mean())
+    avg5 = float(vol.tail(5).mean())
+    avg2 = float(vol.tail(2).mean())
+
+    cond1 = avg5 < avg20
+    cond2 = avg2 > avg5
+
+    return bool(cond1 and cond2)
 
 def is_pullback(df):
     if df is None or len(df) < MIN_HISTORY_DAYS:
@@ -84,129 +91,68 @@ def is_pullback(df):
     last = df.iloc[-1]
     close = safe_float(last["close"])
     ma25 = safe_float(last["ma25"])
+    prev_ma25 = safe_float(df["ma25"].iloc[-6])
 
-    # 25MAより上
+    if not (np.isfinite(close) and np.isfinite(ma25) and np.isfinite(prev_ma25)):
+        return False
+
     if close < ma25:
         return False
 
-    # 25MAが上向き
-    prev_ma25 = safe_float(df["ma25"].iloc[-6])
     if ma25 <= prev_ma25:
         return False
 
-    # RSIゾーン
     rsi = safe_float(last["rsi"])
     if not (RSI_MIN <= rsi <= RSI_MAX):
         return False
 
-    # 出来高パターン
     if not volume_ok(df):
         return False
 
     return True
 
 def calc_in_score(df):
-    """
-    IN確率用スコア（0〜100）
-    ・RSIゾーン
-    ・25MAとの乖離
-    ・出来高転換
-    ・当日値動き
-    を総合評価
-    """
     last = df.iloc[-1]
-    rsi = safe_float(last.get("rsi"))
-    close = safe_float(last.get("close"))
-    ma25 = safe_float(last.get("ma25"))
-    ret_1d = safe_float(last.get("ret_1d"))
+    rsi = safe_float(last["rsi"])
+    close = safe_float(last["close"])
+    ma25 = safe_float(last["ma25"])
+    prev = safe_float(df.iloc[-2]["close"])
 
-    score = 50.0  # ベース
+    score = 50
 
-    # RSI評価
-    if np.isfinite(rsi):
-        if rsi < 28:
-            score += 20   # 強い売られすぎ→反発期待大
-        elif rsi < 35:
+    if rsi <= 32:
+        score += 20
+    elif rsi <= 45:
+        score += 10
+
+    if np.isfinite(close) and np.isfinite(ma25):
+        if abs(close - ma25) / ma25 < 0.01:
             score += 15
-        elif rsi < 45:
-            score += 8
-        elif rsi < 60:
-            score += 0
-        else:
-            score -= 10   # 過熱気味
 
-    # 25MAとの距離
-    if np.isfinite(close) and np.isfinite(ma25) and ma25 > 0:
-        dist = abs(close - ma25) / ma25
-        if dist < 0.005:       # ±0.5%以内
-            score += 15
-        elif dist < 0.01:      # ±1%以内
-            score += 10
-        elif dist < 0.02:      # ±2%以内
-            score += 5
-        elif dist > 0.05:      # 5%以上乖離はマイナス
-            score -= 10
-
-    # 出来高パターン（is_pullback通過してるので基本OK）
     if volume_ok(df):
         score += 10
 
-    # 当日リターン（ヒゲ・反発の質）
-    if np.isfinite(ret_1d):
-        ret_pct = ret_1d * 100
-        if -3.0 <= ret_pct <= 1.0:
-            # 大きく崩れず、小さめの陽線やコマ足
-            score += 5
-        elif ret_pct > 4.0:
-            # 急騰しすぎてると追いかけリスク
-            score -= 5
+    if close > prev:
+        score += 5
 
-    score = max(0.0, min(100.0, score))
-    return int(round(score))
+    return min(score, 100)
 
 def calc_take_profit(df):
-    """
-    利確目安（円）
-    ・直近10日高値
-    ・10MA（ミドル）
-    のハイブリッド
-    """
-    last_close = safe_float(df.iloc[-1]["close"])
+    last = safe_float(df.iloc[-1]["close"])
     recent_high = safe_float(df["close"].tail(10).max())
     bb_mid = safe_float(df["ma10"].iloc[-1])
-
-    if not np.isfinite(recent_high) or not np.isfinite(bb_mid):
-        return int(last_close)
-
-    tp = recent_high * 0.6 + bb_mid * 0.4
+    tp = (recent_high * 0.6 + bb_mid * 0.4)
     return int(tp)
 
 def calc_stop_loss(df):
-    """
-    損切りライン（円）
-    ・直近5日安値
-    ・25MA -1.5%
-    ・直近終値 -3%
-    のうち最も保守的（低い）ライン
-    """
-    last_close = safe_float(df.iloc[-1]["close"])
+    last = safe_float(df.iloc[-1]["close"])
     ma25 = safe_float(df["ma25"].iloc[-1])
     recent_low = safe_float(df["close"].tail(5).min())
 
-    candidates = []
-
-    if np.isfinite(recent_low):
-        candidates.append(recent_low)
-    if np.isfinite(ma25):
-        candidates.append(ma25 * 0.985)
-    if np.isfinite(last_close):
-        candidates.append(last_close * 0.97)
-
-    if not candidates:
-        return int(last_close)
-
-    sl = min(candidates)
-    return int(sl)
+    loss1 = recent_low
+    loss2 = ma25 * 0.985
+    loss3 = last * 0.97
+    return int(min(loss1, loss2, loss3))
 
 def pick_top5():
     rows = []
@@ -226,34 +172,25 @@ def pick_top5():
         price = safe_float(last["close"])
         rsi = safe_float(last["rsi"])
 
-        # 買い目安（下限）
-        ma5 = safe_float(last["ma5"])
-        ma10 = safe_float(last["ma10"])
-        candidates = [v for v in [ma5, ma10, price] if np.isfinite(v)]
-        if not candidates:
-            continue
-        lower = int(min(candidates))
+        lower = int(min([
+            safe_float(last["ma5"]),
+            safe_float(last["ma10"]),
+            price
+        ]))
 
-        # 理由テキスト
         reasons = []
-        if np.isfinite(rsi):
-            if rsi <= 32:
-                reasons.append("RSIが30前後で売られすぎの強い押し目")
-            elif rsi <= 45:
-                reasons.append("RSIが中立〜やや売られでちょうど良い押し目")
-            else:
-                reasons.append("強いトレンド中の浅い押し目")
+        if rsi <= 32:
+            reasons.append("売られすぎの強い押し目")
+        elif rsi <= 45:
+            reasons.append("理想的な押し目")
+        else:
+            reasons.append("軽めの押し目")
 
-        ma25 = safe_float(last["ma25"])
-        if np.isfinite(ma25) and ma25 > 0:
-            dist25 = abs(price - ma25) / ma25
-            if dist25 < 0.01:
-                reasons.append("25日移動平均線タッチ付近")
-            elif dist25 < 0.02:
-                reasons.append("25日線近辺での押し目")
+        if abs(price - safe_float(last["ma25"])) / safe_float(last["ma25"]) < 0.01:
+            reasons.append("25MAタッチ")
 
         if volume_ok(df):
-            reasons.append("出来高が減少から増加に転換（買い需要の出現）")
+            reasons.append("出来高が減→増へ転換")
 
         in_score = calc_in_score(df)
         tp = calc_take_profit(df)
@@ -287,34 +224,13 @@ def build_message():
     lines = []
     lines.append(f"📈 {now} 本日の本命TOP5\n")
 
-    rank = 1
-    for r in cands:
-        lower = float(r["lower"])
-        tp = float(r["tp"])
-        sl = float(r["sl"])
-        score = float(r["score"])
-
-        # 勝率目安（ざっくり目安としての参考値）
-        win_rate = 30.0 + 0.5 * score   # 30〜80%くらいのレンジ
-        win_rate = max(30.0, min(85.0, win_rate))
-
-        # 利確・損切りの％
-        if lower > 0:
-            tp_pct = (tp / lower - 1.0) * 100.0
-            sl_pct = (sl / lower - 1.0) * 100.0
-            tp_pct_str = f"{tp_pct:+.1f}%"
-            sl_pct_str = f"{sl_pct:+.1f}%"
-        else:
-            tp_pct_str = "-"
-            sl_pct_str = "-"
-
-        lines.append(f"{rank}. {r['ticker']}（{r['name']}）")
-        lines.append(f"   IN確率: {int(score)}点（勝率目安: {win_rate:.1f}%）")
-        lines.append(f"   買い目安: {int(lower)}円")
-        lines.append(f"   利確目安: {int(tp)}円（{tp_pct_str}）")
-        lines.append(f"   損切り: {int(sl)}円（{sl_pct_str}）")
+    for i, r in enumerate(cands, 1):
+        lines.append(f"{i}. {r['ticker']}（{r['name']}）")
+        lines.append(f"   IN確率: {r['score']}点")
+        lines.append(f"   買い目安: {r['lower']}円")
+        lines.append(f"   利確目安: {r['tp']}円")
+        lines.append(f"   損切り: {r['sl']}円")
         lines.append(f"   理由: {r['reason']}\n")
-        rank += 1
 
     return "\n".join(lines)
 
@@ -331,17 +247,10 @@ def send_line(message):
     }
 
     data = {"messages": [{"type": "text", "text": message}]}
-    try:
-        resp = requests.post(url, headers=headers, json=data, timeout=10)
-        print("LINE status:", resp.status_code)
-        if resp.status_code != 200:
-            print("LINE response:", resp.text)
-    except Exception as e:
-        print("LINE送信エラー:", e)
+    requests.post(url, headers=headers, json=data)
 
 def main():
     msg = build_message()
-    print(msg)  # ログ用
     send_line(msg)
 
 if __name__ == "__main__":
