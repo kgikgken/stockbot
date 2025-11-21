@@ -492,6 +492,9 @@ def calc_sector_strength() -> pd.DataFrame:
         news_score, materials = fetch_sector_news_info(sector)
         total_score = avg_5d * 0.6 + avg_slope25 * 0.3 + news_score * 0.5
 
+        # 材料トピックは一番多く出ているもの1つだけ
+        top_material = materials[0] if materials else ""
+
         records.append(
             {
                 "sector": sector,
@@ -499,7 +502,7 @@ def calc_sector_strength() -> pd.DataFrame:
                 "avg_5d": avg_5d,
                 "avg_slope25": avg_slope25,
                 "news_score": float(news_score),
-                "materials": ", ".join(materials[:3]),
+                "material": top_material,
                 "total_score": float(total_score),
             }
         )
@@ -568,6 +571,38 @@ def describe_market_score(score: float) -> str:
     if score >= -0.8:
         return "弱気"
     return "かなり弱気"
+
+
+# =============================
+# ヒートマップ用ヘルパー
+# =============================
+
+def _sector_heat_emoji(ret_5d: float) -> str:
+    """5日騰落率からセクターヒートマップ用の色を決める"""
+    if ret_5d >= 2.0:
+        return "🟩"  # 強い上昇
+    elif ret_5d >= 0.5:
+        return "🟨"  # やや上昇
+    elif ret_5d >= -0.5:
+        return "🟦"  # 横ばい〜小動き
+    elif ret_5d >= -2.0:
+        return "🟧"  # やや下落
+    else:
+        return "🟥"  # 下落
+
+
+def _stock_heat_emoji(chg_1d: float) -> str:
+    """日中変化率から銘柄ヒートマップ用の色を決める"""
+    if chg_1d >= 3.0:
+        return "🟩"
+    elif chg_1d >= 1.0:
+        return "🟨"
+    elif chg_1d >= -1.0:
+        return "🟦"
+    elif chg_1d >= -3.0:
+        return "🟧"
+    else:
+        return "🟥"
 
 
 # =============================
@@ -674,22 +709,14 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
 
 
 # =============================
-# 買いレンジ表示フォーマット
+# 買いレンジ表示フォーマット（下限のみ）
 # =============================
 
 def _format_buy_text(low: float, high: float) -> str:
+    """買いレンジ表示：下限のみ。「円付近」も付けない"""
     if not np.isfinite(low):
         return "-"
-    if not np.isfinite(high):
-        high = low
-
-    width = (high - low) / max(abs(low), 1.0)
-
-    # 幅が0.8%未満なら「◯◯円付近」と一点狙い
-    if width <= 0.008:
-        return f"{int(low)}円付近"
-
-    return f"{int(low)}〜{int(high)} 円"
+    return f"{int(low)}円"
 
 
 def _format_candidates_table(df: pd.DataFrame) -> List[str]:
@@ -763,12 +790,18 @@ def build_message() -> str:
             f"ニュース {r['news_score']:.2f} {comment}"
         )
 
+    # --- セクターヒートマップ ---
+    lines.append("\n【セクターヒートマップ（5日騰落率）】")
+    for _, r in sec_df.iterrows():
+        emoji = _sector_heat_emoji(r["avg_5d"])
+        lines.append(f"{emoji} {r['sector']}: {r['avg_5d']:.1f}%")
+
     # --- 主な材料トピック ---
     lines.append("\n【主な材料トピック（上位セクター）】")
     for _, r in top.iterrows():
-        mats = str(r.get("materials", "")).strip()
-        if mats:
-            lines.append(f"- {r['sector']}: {mats}")
+        mat = str(r.get("material", "")).strip()
+        if mat:
+            lines.append(f"- {r['sector']}: {mat}")
 
     # --- TOP5セクター内銘柄 ---
     cands_in = pick_candidates_in_sector(strong_sectors)
@@ -791,6 +824,27 @@ def build_message() -> str:
         for sector, grp in cands_out.groupby("sector"):
             lines.append(f"▼{sector}")
             lines.extend(_format_candidates_table(grp))
+
+    # --- 候補銘柄ヒートマップ ---
+    if not cands_in.empty or not cands_out.empty:
+        lines.append("\n【候補銘柄ヒートマップ（日中変化率）】")
+        try:
+            df_all = []
+            if not cands_in.empty:
+                df_all.append(cands_in[["ticker", "name", "chg_1d"]].copy())
+            if not cands_out.empty:
+                df_all.append(cands_out[["ticker", "name", "chg_1d"]].copy())
+            all_df = pd.concat(df_all, ignore_index=True)
+
+            # 多すぎると見づらいので上位30銘柄まで
+            for _, r in all_df.head(30).iterrows():
+                chg = safe_float(r["chg_1d"])
+                emoji = _stock_heat_emoji(chg)
+                lines.append(
+                    f"{emoji} {r['ticker']}（{r['name']}）: {chg:.1f}%"
+                )
+        except Exception as e:
+            print("[WARN] ヒートマップ生成中にエラー:", e)
 
     return "\n".join(lines)
 
