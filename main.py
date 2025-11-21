@@ -169,7 +169,7 @@ def pick_top5():
             continue
 
         last = df.iloc[-1]
-        price = safe_float(last["close"])
+        price = safe_float(last["close"])  # ★現在株価として利用
         rsi = safe_float(last["rsi"])
 
         lower = int(min([
@@ -199,7 +199,7 @@ def pick_top5():
         rows.append({
             "ticker": ticker,
             "name": name,
-            "price": price,
+            "price": price,   # ★現在株価
             "lower": lower,
             "rsi": rsi,
             "reason": " / ".join(reasons),
@@ -227,7 +227,7 @@ def build_message():
     for i, r in enumerate(cands, 1):
         lines.append(f"{i}. {r['ticker']}（{r['name']}）")
         lines.append(f"   IN確率: {r['score']}点")
-        lines.append(f"   買い目安: {r['lower']}円")
+        lines.append(f"   買い目安: {r['lower']}円（現在 {int(r['price'])}円）")
         lines.append(f"   利確目安: {r['tp']}円")
         lines.append(f"   損切り: {r['sl']}円")
         lines.append(f"   理由: {r['reason']}\n")
