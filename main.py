@@ -4,10 +4,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import quote
+import xml.etree.ElementTree as ET
 
 # =============================
-# 基本設定
+# 基本設定 / Config
 # =============================
 
 UNIVERSE_CSV_PATH = "universe_jpx.csv"
@@ -25,6 +27,19 @@ TOP_SECTOR_COUNT = 5
 WEIGHT_RSI = 0.5
 WEIGHT_MA25 = 0.3
 WEIGHT_VOLUME = 0.2
+
+# ニュース評価用キーワード
+SECTOR_NEWS_KEYWORDS = {
+    "石油・石炭製品": "石油 セクター",
+    "医薬品": "医薬品 セクター",
+    "海運業": "海運 セクター",
+    "鉱業": "鉱業 セクター",
+    "陸運業": "陸運 セクター",
+    # 必要に応じて追加。なければ sector 名がそのまま使われる
+}
+
+POSITIVE_WORDS = ["増益", "上方修正", "最高益", "好調", "堅調", "続伸", "買い", "急騰"]
+NEGATIVE_WORDS = ["減益", "下方修正", "悪化", "下落", "急落", "売り", "軟調"]
 
 # LINE 1メッセージの安全上限（公式は5000文字だが余裕を持たせる）
 MAX_LINE_TEXT_LEN = 3900
@@ -63,8 +78,10 @@ def load_universe() -> pd.DataFrame:
     df["ticker"] = df["ticker"].astype(str)
     df["name"] = df["name"].astype(str)
     df["sector"] = df["sector"].astype(str)
-    df["industry_big"] = df["industry_big"].astype(str)
-    df["market"] = df["market"].astype(str)
+    if "industry_big" in df.columns:
+        df["industry_big"] = df["industry_big"].astype(str)
+    if "market" in df.columns:
+        df["market"] = df["market"].astype(str)
 
     return df
 
@@ -75,7 +92,52 @@ TICKER_SECTOR: Dict[str, str] = dict(zip(UNIVERSE_DF["ticker"], UNIVERSE_DF["sec
 
 
 # =============================
-# データ取得 & 加工
+# ニューススコア
+# =============================
+
+def fetch_sector_news_score(sector: str) -> float:
+    """
+    Google News RSS をたたいて、そのセクターの
+    「ポジ/ネガ度」をざっくりスコア化する。
+    失敗時は 0.0 を返す。
+    """
+    try:
+        keyword = SECTOR_NEWS_KEYWORDS.get(sector, sector)
+        query = quote(keyword + " 株")
+        url = (
+            "https://news.google.com/rss/search?"
+            f"q={query}&hl=ja&gl=JP&ceid=JP:ja"
+        )
+
+        resp = requests.get(url, timeout=5)
+        if resp.status_code != 200:
+            return 0.0
+
+        root = ET.fromstring(resp.content)
+        items = root.findall(".//item")
+        if not items:
+            return 0.0
+
+        score = 0.0
+        for item in items:
+            title = item.findtext("title", default="")
+            # ポジ・ネガ単語数で加点・減点
+            for w in POSITIVE_WORDS:
+                if w in title:
+                    score += 1.0
+            for w in NEGATIVE_WORDS:
+                if w in title:
+                    score -= 1.0
+
+        score /= max(len(items), 1)  # 件数で正規化
+        return float(score)
+    except Exception as e:
+        print(f"[WARN] ニュース取得失敗: sector={sector} / {e}")
+        return 0.0
+
+
+# =============================
+# テクニカル指標
 # =============================
 
 def add_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
@@ -92,6 +154,52 @@ def add_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     df["rsi"] = rsi
     return df
 
+
+def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """ATR(平均的な値動き幅)を計算して atr 列に追加"""
+    if not {"High", "Low", "Close"}.issubset(df.columns):
+        df["atr"] = np.nan
+        return df
+
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+    prev_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+
+    df["atr"] = atr
+    return df
+
+
+def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
+    """VWAP（出来高加重平均価格）を計算して vwap 列に追加"""
+    if not {"High", "Low", "Close", "Volume"}.issubset(df.columns):
+        df["vwap"] = np.nan
+        return df
+
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+    vol = df["Volume"].fillna(0).astype(float)
+
+    typical_price = (high + low + close) / 3.0
+    cum_vol = vol.cumsum()
+    cum_tp_vol = (typical_price * vol).cumsum()
+
+    vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
+    df["vwap"] = vwap
+    return df
+
+
+# =============================
+# データ取得 & 加工
+# =============================
 
 def fetch_history(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
     """
@@ -121,16 +229,154 @@ def fetch_history(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
     df["ma25"] = df["close"].rolling(25).mean()
 
     df = add_rsi(df)
+    df = add_atr(df)
+    df = add_vwap(df)
 
     return df
 
 
 # =============================
-# セクター強度計算
+# 出来高パターン判定
+# =============================
+
+def volume_pattern_ok(df: pd.DataFrame) -> bool:
+    """
+    出来高の「減少 → 増加」パターンを判定する。
+    ・直近20日平均より直近5日平均の方が小さい → 減少局面
+    ・直近5日平均より直近2日平均の方が大きい → 増加転換
+    """
+    if "Volume" not in df.columns:
+        return False
+
+    vol = df["Volume"].fillna(0)
+
+    # データが少なすぎる場合は判定しない
+    if len(vol) < 20:
+        return False
+
+    avg20 = float(vol.tail(20).mean())
+    avg5 = float(vol.tail(5).mean())
+    avg2 = float(vol.tail(2).mean())
+
+    cond_decrease = avg5 < avg20   # 減少
+    cond_increase = avg2 > avg5    # 増加
+
+    return bool(cond_decrease and cond_increase)
+
+
+# =============================
+# 押し目判定ロジック
+# =============================
+
+def is_uptrend(df: pd.DataFrame) -> bool:
+    """25日線の上＆25日線が上向きか"""
+    if len(df) < 30:
+        return False
+
+    last = df.iloc[-1]
+    close_now = safe_float(last["close"])
+    ma25_now = safe_float(last["ma25"])
+    ma25_prev = safe_float(df["ma25"].iloc[-6])
+
+    if not np.isfinite(close_now) or not np.isfinite(ma25_now) or not np.isfinite(ma25_prev):
+        return False
+
+    if close_now < ma25_now:
+        return False
+    if ma25_now <= ma25_prev:
+        return False
+
+    return True
+
+
+def is_near_ma(df: pd.DataFrame) -> bool:
+    """MA5 or MA10 に近いか（±PULLBACK_MA_TOL）"""
+    last = df.iloc[-1]
+    close_now = safe_float(last["close"])
+    ma5 = safe_float(last["ma5"])
+    ma10 = safe_float(last["ma10"])
+
+    if not np.isfinite(close_now):
+        return False
+
+    cond_ma5 = np.isfinite(ma5) and abs(close_now - ma5) / ma5 <= PULLBACK_MA_TOL
+    cond_ma10 = np.isfinite(ma10) and abs(close_now - ma10) / ma10 <= PULLBACK_MA_TOL
+    return bool(cond_ma5 or cond_ma10)
+
+
+def is_rsi_ok(df: pd.DataFrame) -> bool:
+    """RSI がレンジ内か"""
+    last = df.iloc[-1]
+    rsi = safe_float(last.get("rsi", np.nan))
+    return bool(np.isfinite(rsi) and RSI_MIN <= rsi <= RSI_MAX)
+
+
+def is_volume_turn(df: pd.DataFrame) -> bool:
+    """出来高の減少 → 増加パターン"""
+    return volume_pattern_ok(df)
+
+
+def is_pullback(df: pd.DataFrame) -> bool:
+    """押し目判定ロジック（上昇トレンド / MA / RSI / 出来高）"""
+    if df is None or len(df) < MIN_HISTORY_DAYS:
+        return False
+
+    return all(
+        [
+            is_uptrend(df),
+            is_near_ma(df),
+            is_rsi_ok(df),
+            is_volume_turn(df),
+        ]
+    )
+
+
+# =============================
+# 買いレンジ計算（ATR + VWAP ベース）
+# =============================
+
+def calc_buy_range(df: pd.DataFrame) -> Tuple[float, float]:
+    """
+    ATR＋VWAP＋短期MAから押し目の買いレンジを計算。
+    ベース価格付近から少し下に 0.8ATR〜0.2ATR の幅でレンジを作る。
+    """
+    last = df.iloc[-1]
+
+    price = safe_float(last["close"])
+    ma5 = safe_float(last.get("ma5", np.nan))
+    ma10 = safe_float(last.get("ma10", np.nan))
+    vwap = safe_float(last.get("vwap", np.nan))
+    atr = safe_float(last.get("atr", np.nan))
+
+    base_candidates = [v for v in [ma5, ma10, vwap, price] if np.isfinite(v)]
+    base = float(np.mean(base_candidates)) if base_candidates else price
+
+    if np.isfinite(atr) and atr > 0:
+        buy_upper = base - 0.2 * atr
+        buy_lower = base - 0.8 * atr
+    else:
+        if base_candidates:
+            buy_lower = min(base_candidates)
+            buy_upper = max(base_candidates)
+        else:
+            buy_lower = price
+            buy_upper = price
+
+    if buy_lower > buy_upper:
+        buy_lower, buy_upper = buy_upper, buy_lower
+
+    return buy_lower, buy_upper
+
+
+# =============================
+# セクター強度計算（ニュース込み）
 # =============================
 
 def calc_sector_strength() -> pd.DataFrame:
-    """各セクターの1日・5日騰落率と25日線傾きを計算"""
+    """
+    各セクターの1日・5日騰落率、25日線傾きにニューススコアを加え、
+    total_score で強弱を評価。
+    """
     records = []
 
     for sector, grp in UNIVERSE_DF.groupby("sector"):
@@ -173,93 +419,27 @@ def calc_sector_strength() -> pd.DataFrame:
             continue
 
         arr = np.array(vals, dtype=float)
+        avg_1d = float(arr[:, 0].mean())
+        avg_5d = float(arr[:, 1].mean())
+        avg_slope25 = float(arr[:, 2].mean())
+
+        news = fetch_sector_news_score(sector)
+
+        # 総合スコア（重みは好みに応じて微調整可）
+        total_score = avg_5d * 0.6 + avg_slope25 * 0.3 + news * 0.5
+
         records.append(
             {
                 "sector": sector,
-                "avg_1d": float(arr[:, 0].mean()),
-                "avg_5d": float(arr[:, 1].mean()),
-                "avg_slope25": float(arr[:, 2].mean()),
+                "avg_1d": avg_1d,
+                "avg_5d": avg_5d,
+                "avg_slope25": avg_slope25,
+                "news_score": news,
+                "total_score": total_score,
             }
         )
 
     return pd.DataFrame(records)
-
-
-# =============================
-# 出来高パターン判定
-# =============================
-
-def volume_pattern_ok(df: pd.DataFrame) -> bool:
-    """
-    出来高の「減少 → 増加」パターンを判定する。
-    ・直近20日平均より直近5日平均の方が小さい → 減少局面
-    ・直近5日平均より直近2日平均の方が大きい → 増加転換
-    """
-    if "Volume" not in df.columns:
-        return False
-
-    vol = df["Volume"].fillna(0)
-
-    # データが少なすぎる場合は判定しない
-    if len(vol) < 20:
-        return False
-
-    # float にして Series のあいまい判定をなくす
-    avg20 = float(vol.tail(20).mean())
-    avg5 = float(vol.tail(5).mean())
-    avg2 = float(vol.tail(2).mean())
-
-    cond_decrease = avg5 < avg20   # 減少
-    cond_increase = avg2 > avg5    # 増加
-
-    return bool(cond_decrease and cond_increase)
-
-
-# =============================
-# 押し目判定ロジック
-# =============================
-
-def is_pullback(df: pd.DataFrame) -> bool:
-    """押し目判定ロジック（RSI / MA / 25MA / 出来高など）"""
-    if df is None or len(df) < MIN_HISTORY_DAYS:
-        return False
-
-    last = df.iloc[-1]
-    close_now = safe_float(last["close"])
-    ma5 = safe_float(last["ma5"])
-    ma10 = safe_float(last["ma10"])
-    ma25 = safe_float(last["ma25"])
-
-    if not np.isfinite(close_now) or not np.isfinite(ma25):
-        return False
-
-    # 1. 25日線の上
-    if close_now < ma25:
-        return False
-
-    # 2. 25日線が上向き
-    if len(df) < 30:
-        return False
-    ma25_prev = safe_float(df["ma25"].iloc[-6])
-    if not np.isfinite(ma25_prev) or ma25 <= ma25_prev:
-        return False
-
-    # 3. MA乖離 ±5%
-    cond_ma5 = np.isfinite(ma5) and abs(close_now - ma5) / ma5 <= PULLBACK_MA_TOL
-    cond_ma10 = np.isfinite(ma10) and abs(close_now - ma10) / ma10 <= PULLBACK_MA_TOL
-    if not (cond_ma5 or cond_ma10):
-        return False
-
-    # 4. RSI
-    rsi = safe_float(last.get("rsi", np.nan))
-    if not (RSI_MIN <= rsi <= RSI_MAX):
-        return False
-
-    # 5. 出来高パターン
-    if not volume_pattern_ok(df):
-        return False
-
-    return True
 
 
 # =============================
@@ -286,11 +466,7 @@ def pick_candidates_in_sector(strong_sectors: List[str]) -> pd.DataFrame:
         chg_1d = safe_float(last["ret_1d"]) * 100
         rsi = safe_float(last.get("rsi"))
 
-        ma5 = safe_float(last["ma5"])
-        ma10 = safe_float(last["ma10"])
-        valid_vals = [v for v in [ma5, ma10, price] if np.isfinite(v)]
-        buy_lower = min(valid_vals) if valid_vals else price
-        buy_upper = max(valid_vals) if valid_vals else price
+        buy_lower, buy_upper = calc_buy_range(df)
 
         rows.append(
             {
@@ -333,12 +509,7 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
         chg_1d = safe_float(last["ret_1d"]) * 100
         rsi = safe_float(last.get("rsi"))
 
-        # 5MA・10MAから買いレンジ
-        ma5 = safe_float(last["ma5"])
-        ma10 = safe_float(last["ma10"])
-        valid_vals = [v for v in [ma5, ma10, price] if np.isfinite(v)]
-        buy_lower = min(valid_vals) if valid_vals else price
-        buy_upper = max(valid_vals) if valid_vals else price
+        buy_lower, buy_upper = calc_buy_range(df)
 
         # MA25乖離
         ma25 = safe_float(last["ma25"])
@@ -389,6 +560,18 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
 # メッセージ生成
 # =============================
 
+def _format_candidates_table(df: pd.DataFrame) -> List[str]:
+    """銘柄 DataFrame を '銘柄 | 買いレンジ' の表に整形して行リストで返す"""
+    lines: List[str] = []
+    lines.append("銘柄 | 買いレンジ")
+    lines.append("---- | ----")
+    for _, r in df.iterrows():
+        lines.append(
+            f"{r['ticker']}（{r['name']}） | {int(r['buy_lower'])}〜{int(r['buy_upper'])} 円"
+        )
+    return lines
+
+
 def build_message() -> str:
     """LINEで送るメッセージ本文を作成"""
 
@@ -397,7 +580,8 @@ def build_message() -> str:
     if sec_df.empty:
         return "セクター情報が取得できませんでした。"
 
-    sec_df = sec_df.sort_values("avg_5d", ascending=False)
+    # ニュース込み総合スコアでソート
+    sec_df = sec_df.sort_values("total_score", ascending=False)
     top = sec_df.head(TOP_SECTOR_COUNT).reset_index(drop=True)
     strong_sectors = list(top["sector"])
 
@@ -405,11 +589,13 @@ def build_message() -> str:
     lines: List[str] = []
     lines.append(f"📈 {now:%Y-%m-%d} スイング候補レポート\n")
 
-    # --- TOP5セクター ---
+    # --- TOP5セクターの状況 ---
     lines.append("【今日のテーマ候補（セクターベース）】")
     for _, r in top.iterrows():
         comment = ""
-        if r["avg_5d"] > 0 and r["avg_slope25"] > 0:
+        if r["avg_5d"] > 0 and r["avg_slope25"] > 0 and r["news_score"] > 0:
+            comment = "（ニュース追い風の強い上昇トレンド）"
+        elif r["avg_5d"] > 0 and r["avg_slope25"] > 0:
             comment = "（強い上昇トレンド）"
         elif r["avg_5d"] > 0:
             comment = "（短期強め）"
@@ -420,11 +606,11 @@ def build_message() -> str:
 
         lines.append(
             f"- {r['sector']}: 1日 {r['avg_1d']:.1f}% / "
-            f"5日 {r['avg_5d']:.1f}% / 25日線傾き {r['avg_slope25']:.2f}% "
-            f"{comment}"
+            f"5日 {r['avg_5d']:.1f}% / 25日線傾き {r['avg_slope25']:.2f}% / "
+            f"ニュース {r['news_score']:.2f} {comment}"
         )
 
-    # --- TOP5内銘柄 ---
+    # --- TOP5内銘柄（表形式） ---
     cands_in = pick_candidates_in_sector(strong_sectors)
 
     lines.append("\n【押し目スイング候補（TOP5セクター内）】")
@@ -433,14 +619,7 @@ def build_message() -> str:
     else:
         for sector, grp in cands_in.groupby("sector"):
             lines.append(f"▼{sector}")
-            for _, r in grp.iterrows():
-                lines.append(
-                    f"  - {r['ticker']}（{r['name']}）: 終値 {r['price']:.1f}円 / "
-                    f"日中変化 {r['chg_1d']:.1f}% / RSI {r['rsi']:.1f}"
-                )
-                lines.append(
-                    f"      買うなら: {r['buy_lower']:.0f}〜{r['buy_upper']:.0f} 円"
-                )
+            lines.extend(_format_candidates_table(grp))
 
     # --- セクター外候補（ACDE複合スコア） ---
     cands_out = pick_candidates_outside_sector(strong_sectors)
@@ -451,14 +630,7 @@ def build_message() -> str:
     else:
         for sector, grp in cands_out.groupby("sector"):
             lines.append(f"▼{sector}")
-            for _, r in grp.iterrows():
-                lines.append(
-                    f"  - {r['ticker']}（{r['name']}）: 終値 {r['price']:.1f}円 / "
-                    f"日中変化 {r['chg_1d']:.1f}% / RSI {r['rsi']:.1f}"
-                )
-                lines.append(
-                    f"      買うなら: {r['buy_lower']:.0f}〜{r['buy_upper']:.0f} 円"
-                )
+            lines.extend(_format_candidates_table(grp))
 
     return "\n".join(lines)
 
@@ -503,7 +675,7 @@ def send_line(message: str) -> None:
     chunks = _split_message(message)
 
     for i in range(0, len(chunks), 5):  # 1リクエスト最大5メッセージ
-        batch = chunks[i : i + 5]
+        batch = chunks[i: i + 5]
         data = {"messages": [{"type": "text", "text": t} for t in batch]}
 
         try:
