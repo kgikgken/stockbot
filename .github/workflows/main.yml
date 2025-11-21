@@ -2,7 +2,7 @@ name: LINE Test Send
 
 on:
   schedule:
-    - cron: "0 23 * * *"  # JST 8:00（UTC 23:00）
+    - cron: "0 22 * * *"  # JST 7:00（UTC 22:00）
   workflow_dispatch:
 
 jobs:
