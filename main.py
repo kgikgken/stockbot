@@ -233,8 +233,6 @@ def fetch_history(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
     df = add_vwap(df)
 
     return df
-
-
 # =============================
 # 出来高パターン判定
 # =============================
@@ -250,7 +248,6 @@ def volume_pattern_ok(df: pd.DataFrame) -> bool:
 
     vol = df["Volume"].fillna(0)
 
-    # データが少なすぎる場合は判定しない
     if len(vol) < 20:
         return False
 
@@ -258,10 +255,46 @@ def volume_pattern_ok(df: pd.DataFrame) -> bool:
     avg5 = float(vol.tail(5).mean())
     avg2 = float(vol.tail(2).mean())
 
-    cond_decrease = avg5 < avg20   # 減少
-    cond_increase = avg2 > avg5    # 増加
+    cond_decrease = avg5 < avg20
+    cond_increase = avg2 > avg5
 
     return bool(cond_decrease and cond_increase)
+
+
+# =============================
+# 強化版 W流動性フィルター
+# =============================
+
+def is_liquid(df: pd.DataFrame,
+              min_volume: int = 200000,
+              min_value: int = 500_000_000) -> bool:
+    """
+    W流動性フィルター（強化版）：
+    ・直近5日平均出来高 >= min_volume（デフォ20万株）
+    ・今日の売買代金 >= min_value（デフォ5億円）
+    """
+    if "Volume" not in df.columns:
+        return False
+
+    vol = df["Volume"].fillna(0)
+    if len(vol) < 5:
+        return False
+
+    avg5 = vol.tail(5).mean()
+    if avg5 < min_volume:
+        return False
+
+    last = df.iloc[-1]
+    price = safe_float(last.get("close"))
+    today_vol = safe_float(last.get("Volume"))
+    if not (np.isfinite(price) and np.isfinite(today_vol)):
+        return False
+
+    value = price * today_vol
+    if value < min_value:
+        return False
+
+    return True
 
 
 # =============================
@@ -317,8 +350,12 @@ def is_volume_turn(df: pd.DataFrame) -> bool:
 
 
 def is_pullback(df: pd.DataFrame) -> bool:
-    """押し目判定ロジック（上昇トレンド / MA / RSI / 出来高）"""
+    """押し目判定ロジック（上昇トレンド / MA / RSI / 出来高 / 流動性）"""
     if df is None or len(df) < MIN_HISTORY_DAYS:
+        return False
+
+    # 🔥 強化W流動性フィルター
+    if not is_liquid(df):
         return False
 
     return all(
@@ -332,7 +369,7 @@ def is_pullback(df: pd.DataFrame) -> bool:
 
 
 # =============================
-# 買いレンジ計算（ATR + VWAP ベース）
+# 買いレンジ計算（ATR + VWAP）
 # =============================
 
 def calc_buy_range(df: pd.DataFrame) -> Tuple[float, float]:
@@ -425,7 +462,6 @@ def calc_sector_strength() -> pd.DataFrame:
 
         news = fetch_sector_news_score(sector)
 
-        # 総合スコア（重みは好みに応じて微調整可）
         total_score = avg_5d * 0.6 + avg_slope25 * 0.3 + news * 0.5
 
         records.append(
@@ -526,11 +562,10 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
         else:
             vol_score = 1.0
 
-        # ACDEスコア（低い順が強い押し目）
         score = (
             (rsi if np.isfinite(rsi) else 100.0) * WEIGHT_RSI
             + (ma25_dis if np.isfinite(ma25_dis) else 1.0) * WEIGHT_MA25
-            + (-vol_score) * WEIGHT_VOLUME  # 出来高増加は良いのでマイナス
+            + (-vol_score) * WEIGHT_VOLUME
         )
 
         rows.append(
@@ -557,7 +592,7 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
 
 
 # =============================
-# メッセージ生成
+# 表形式整形（LINE用）
 # =============================
 
 def _format_candidates_table(df: pd.DataFrame) -> List[str]:
@@ -570,7 +605,9 @@ def _format_candidates_table(df: pd.DataFrame) -> List[str]:
             f"{r['ticker']}（{r['name']}） | {int(r['buy_lower'])}〜{int(r['buy_upper'])} 円"
         )
     return lines
-
+# =============================
+# メッセージ生成
+# =============================
 
 def build_message() -> str:
     """LINEで送るメッセージ本文を作成"""
@@ -648,7 +685,6 @@ def _split_message(text: str, limit: int = MAX_LINE_TEXT_LEN) -> List[str]:
     current = ""
 
     for line in text.split("\n"):
-        # +1 は改行分
         if len(current) + len(line) + 1 > limit:
             parts.append(current.rstrip())
             current = ""
@@ -695,7 +731,6 @@ def main() -> None:
     try:
         msg = build_message()
     except Exception as e:
-        # ここで落ちても、エラー内容をLINEに送る
         error_msg = f"スクリーニング中にエラーが発生しました: {e}"
         print("[ERROR] build_message 失敗:", e)
         msg = error_msg
