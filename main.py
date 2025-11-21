@@ -39,14 +39,30 @@ SECTOR_NEWS_KEYWORDS = {
     "海運業": "海運 セクター",
     "鉱業": "鉱業 セクター",
     "陸運業": "陸運 セクター",
-    # 必要に応じて追加。なければ sector 名がそのまま使われる
+    # 必要に応じて追加
 }
 
 POSITIVE_WORDS = ["増益", "上方修正", "最高益", "好調", "堅調", "続伸", "買い", "急騰"]
 NEGATIVE_WORDS = ["減益", "下方修正", "悪化", "下落", "急落", "売り", "軟調"]
 
-# LINE 1メッセージの安全上限（公式は5000文字だが余裕を持たせる）
+# 材料タグ用キーワード
+MATERIAL_KEYWORDS = {
+    "決算": ["決算", "四半期", "通期", "業績"],
+    "上方修正": ["上方修正", "増額修正"],
+    "下方修正": ["下方修正", "減額修正"],
+    "増配・株主還元": ["増配", "配当", "自社株買い", "株主還元"],
+    "提携・M&A": ["提携", "協業", "合弁", "M&A", "買収", "資本業務提携"],
+    "AI・DX": ["AI", "生成AI", "DX", "デジタル"],
+    "新製品・サービス": ["新製品", "新サービス", "発売", "発表", "投入"],
+    "設備投資・増産": ["設備投資", "新工場", "増産", "生産能力", "建設"],
+    "不祥事・行政処分": ["行政処分", "業務停止", "不祥事", "不正", "改善命令", "検査"],
+}
+
+# LINE 文字数
 MAX_LINE_TEXT_LEN = 3900
+
+# ニュースキャッシュ
+NEWS_CACHE: Dict[str, Dict[str, object]] = {}
 
 
 # =============================
@@ -74,7 +90,6 @@ def safe_float(x) -> float:
 # =============================
 
 def load_universe() -> pd.DataFrame:
-    """universe_jpx.csv を読み込み、整形して返す"""
     if not os.path.exists(UNIVERSE_CSV_PATH):
         raise FileNotFoundError(f"{UNIVERSE_CSV_PATH} が見つかりません")
 
@@ -98,14 +113,18 @@ TICKER_SECTOR: Dict[str, str] = dict(zip(UNIVERSE_DF["ticker"], UNIVERSE_DF["sec
 
 
 # =============================
-# ニューススコア
+# ニューススコア & 材料要約
 # =============================
 
-def fetch_sector_news_score(sector: str) -> float:
+def fetch_sector_news_info(sector: str) -> Tuple[float, List[str]]:
     """
-    Google News RSS を叩いてセクターのニュースの
-    ポジ/ネガ度をざっくりスコア化。失敗時は 0.0。
+    そのセクターのニューススコアと材料タグ一覧を返す。
+    （Google News RSS を使用。1回取得したら NEWS_CACHE に保存）
     """
+    if sector in NEWS_CACHE:
+        info = NEWS_CACHE[sector]
+        return info["score"], info["materials"]
+
     try:
         keyword = SECTOR_NEWS_KEYWORDS.get(sector, sector)
         query = quote(keyword + " 株")
@@ -116,18 +135,23 @@ def fetch_sector_news_score(sector: str) -> float:
 
         resp = requests.get(url, timeout=5)
         if resp.status_code != 200:
-            return 0.0
+            NEWS_CACHE[sector] = {"score": 0.0, "materials": []}
+            return 0.0, []
 
         root = ET.fromstring(resp.content)
         items = root.findall(".//item")
         if not items:
-            return 0.0
+            NEWS_CACHE[sector] = {"score": 0.0, "materials": []}
+            return 0.0, []
 
         score = 0.0
+        material_counts = {k: 0 for k in MATERIAL_KEYWORDS.keys()}
+
         for item in items:
             title_raw = item.findtext("title", default="")
             title = str(title_raw)
 
+            # ポジ・ネガ判定
             for w in POSITIVE_WORDS:
                 if w in title:
                     score += 1.0
@@ -135,11 +159,26 @@ def fetch_sector_news_score(sector: str) -> float:
                 if w in title:
                     score -= 1.0
 
+            # 材料タグ
+            for tag, words in MATERIAL_KEYWORDS.items():
+                if any(word in title for word in words):
+                    material_counts[tag] += 1
+
         score /= max(len(items), 1)
-        return float(score)
+
+        sorted_materials = sorted(
+            [k for k, v in material_counts.items() if v > 0],
+            key=lambda k: material_counts[k],
+            reverse=True,
+        )
+
+        NEWS_CACHE[sector] = {"score": float(score), "materials": sorted_materials}
+        return float(score), sorted_materials
+
     except Exception as e:
         print(f"[WARN] ニュース取得失敗: sector={sector} / {e}")
-        return 0.0
+        NEWS_CACHE[sector] = {"score": 0.0, "materials": []}
+        return 0.0, []
 
 
 # =============================
@@ -234,7 +273,9 @@ def fetch_history(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
     df = add_vwap(df)
 
     return df
-    # =============================
+
+
+# =============================
 # 出来高パターン判定
 # =============================
 
@@ -352,10 +393,14 @@ def is_pullback(df: pd.DataFrame) -> bool:
 
 
 # =============================
-# 買いレンジ計算（ATR + VWAP）
+# 買いレンジ計算（精密・下限寄り）
 # =============================
 
 def calc_buy_range(df: pd.DataFrame) -> Tuple[float, float]:
+    """
+    MA5 / MA10 / VWAP / ATR を使って
+    下限寄りの狭い買いレンジを計算
+    """
     last = df.iloc[-1]
 
     price = safe_float(last["close"])
@@ -368,8 +413,9 @@ def calc_buy_range(df: pd.DataFrame) -> Tuple[float, float]:
     base = float(np.mean(base_candidates)) if base_candidates else price
 
     if np.isfinite(atr) and atr > 0:
-        buy_upper = base - 0.2 * atr
-        buy_lower = base - 0.8 * atr
+        # ATR の0.7〜0.3部分をレンジにする（下限寄り）
+        buy_lower = base - 0.7 * atr
+        buy_upper = base - 0.3 * atr
     else:
         if base_candidates:
             buy_lower = min(base_candidates)
@@ -389,10 +435,6 @@ def calc_buy_range(df: pd.DataFrame) -> Tuple[float, float]:
 # =============================
 
 def calc_sector_strength() -> pd.DataFrame:
-    """
-    各セクターの1日・5日騰落率、25日線傾きにニューススコアを加え、
-    total_score で強弱を評価。
-    """
     records = []
 
     for sector, grp in UNIVERSE_DF.groupby("sector"):
@@ -447,8 +489,8 @@ def calc_sector_strength() -> pd.DataFrame:
         avg_5d = float(arr[:, 1].mean())
         avg_slope25 = float(arr[:, 2].mean())
 
-        news = float(fetch_sector_news_score(sector))
-        total_score = avg_5d * 0.6 + avg_slope25 * 0.3 + news * 0.5
+        news_score, materials = fetch_sector_news_info(sector)
+        total_score = avg_5d * 0.6 + avg_slope25 * 0.3 + news_score * 0.5
 
         records.append(
             {
@@ -456,12 +498,76 @@ def calc_sector_strength() -> pd.DataFrame:
                 "avg_1d": avg_1d,
                 "avg_5d": avg_5d,
                 "avg_slope25": avg_slope25,
-                "news_score": news,
+                "news_score": float(news_score),
+                "materials": ", ".join(materials[:3]),
                 "total_score": float(total_score),
             }
         )
 
     return pd.DataFrame(records)
+
+
+# =============================
+# 相場地合いスコア（N225 / TOPIX）
+# =============================
+
+def calc_market_regime() -> Dict[str, Dict[str, float]]:
+    indices = {
+        "日経平均": "^N225",
+        "TOPIX ETF": "1306.T",  # TOPIX連動ETF
+    }
+
+    result: Dict[str, Dict[str, float]] = {}
+
+    for name, ticker in indices.items():
+        df = fetch_history(ticker)
+        if df is None or len(df) < 25:
+            continue
+
+        last = df.iloc[-1]
+        close_now = safe_float(last["close"])
+
+        if len(df) >= 6:
+            base_close = safe_float(df["close"].iloc[-6])
+            ma25_prev = safe_float(df["ma25"].iloc[-6])
+        else:
+            base_close = safe_float(df["close"].iloc[0])
+            ma25_prev = safe_float(df["ma25"].iloc[0])
+
+        if base_close <= 0 or not np.isfinite(base_close):
+            continue
+
+        ret_1d = float(safe_float(last.get("ret_1d", np.nan)) * 100)
+        ret_5d = float((close_now / base_close - 1) * 100)
+
+        ma25_now = safe_float(last.get("ma25", np.nan))
+        if np.isfinite(ma25_now) and np.isfinite(ma25_prev) and ma25_prev != 0:
+            slope25 = float((ma25_now - ma25_prev) / ma25_prev * 100)
+        else:
+            slope25 = 0.0
+
+        score = ret_5d * 0.6 + slope25 * 0.4
+
+        result[name] = {
+            "ret_1d": ret_1d,
+            "ret_5d": ret_5d,
+            "slope25": slope25,
+            "score": score,
+        }
+
+    return result
+
+
+def describe_market_score(score: float) -> str:
+    if score >= 1.0:
+        return "かなり強気"
+    if score >= 0.4:
+        return "強気"
+    if score >= -0.2:
+        return "中立"
+    if score >= -0.8:
+        return "弱気"
+    return "かなり弱気"
 
 
 # =============================
@@ -562,29 +668,51 @@ def pick_candidates_outside_sector(strong_sectors: List[str]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    df = df.sort_values("score")
+    df = df.sort_values("score")  # スコアが低いほど良い押し目
 
     return df
 
 
 # =============================
-# 表形式整形（LINE用）
+# 買いレンジ表示フォーマット
 # =============================
+
+def _format_buy_text(low: float, high: float) -> str:
+    if not np.isfinite(low):
+        return "-"
+    if not np.isfinite(high):
+        high = low
+
+    width = (high - low) / max(abs(low), 1.0)
+
+    # 幅が0.8%未満なら「◯◯円付近」と一点狙い
+    if width <= 0.008:
+        return f"{int(low)}円付近"
+
+    return f"{int(low)}〜{int(high)} 円"
+
 
 def _format_candidates_table(df: pd.DataFrame) -> List[str]:
     lines: List[str] = []
     lines.append("銘柄 | 買いレンジ")
     lines.append("---- | ----")
     for _, r in df.iterrows():
+        txt = _format_buy_text(safe_float(r["buy_lower"]), safe_float(r["buy_upper"]))
         lines.append(
-            f"{r['ticker']}（{r['name']}） | {int(r['buy_lower'])}〜{int(r['buy_upper'])} 円"
+            f"{r['ticker']}（{r['name']}） | {txt}"
         )
     return lines
-    # =============================
+
+
+# =============================
 # メッセージ生成
 # =============================
 
 def build_message() -> str:
+    # 地合い
+    market = calc_market_regime()
+
+    # セクター強度
     sec_df = calc_sector_strength()
     if sec_df.empty:
         return "セクター情報が取得できませんでした。"
@@ -597,6 +725,24 @@ def build_message() -> str:
     lines: List[str] = []
     lines.append(f"📈 {now:%Y-%m-%d} スイング候補レポート\n")
 
+    # --- 相場地合いスコア ---
+    if market:
+        lines.append("【相場地合いスコア】")
+        total = 0.0
+        n = 0
+        for name, vals in market.items():
+            desc = describe_market_score(vals["score"])
+            lines.append(
+                f"- {name}: 1日 {vals['ret_1d']:.1f}% / 5日 {vals['ret_5d']:.1f}% / "
+                f"25日線傾き {vals['slope25']:.2f}% → {desc}"
+            )
+            total += vals["score"]
+            n += 1
+        if n:
+            overall = describe_market_score(total / n)
+            lines.append(f"⇒ 地合い総合評価: {overall}\n")
+
+    # --- セクター強度 ---
     lines.append("【今日のテーマ候補（セクターベース）】")
     for _, r in top.iterrows():
         comment = ""
@@ -617,6 +763,14 @@ def build_message() -> str:
             f"ニュース {r['news_score']:.2f} {comment}"
         )
 
+    # --- 主な材料トピック ---
+    lines.append("\n【主な材料トピック（上位セクター）】")
+    for _, r in top.iterrows():
+        mats = str(r.get("materials", "")).strip()
+        if mats:
+            lines.append(f"- {r['sector']}: {mats}")
+
+    # --- TOP5セクター内銘柄 ---
     cands_in = pick_candidates_in_sector(strong_sectors)
 
     lines.append("\n【押し目スイング候補（TOP5セクター内）】")
@@ -627,6 +781,7 @@ def build_message() -> str:
             lines.append(f"▼{sector}")
             lines.extend(_format_candidates_table(grp))
 
+    # --- セクター外候補（ACDE複合スコア） ---
     cands_out = pick_candidates_outside_sector(strong_sectors)
 
     lines.append("\n【セクター外おすすめ押し目銘柄】")
@@ -677,7 +832,7 @@ def send_line(message: str) -> None:
 
     chunks = _split_message(message)
 
-    for i in range(0, len(chunks), 5):
+    for i in range(0, len(chunks), 5):  # 1リクエスト最大5メッセージ
         batch = chunks[i: i + 5]
         data = {"messages": [{"type": "text", "text": t} for t in batch]}
 
