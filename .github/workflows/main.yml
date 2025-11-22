@@ -1,29 +1,27 @@
-name: LINE Test Send
+name: stockbot
 
 on:
   schedule:
-    - cron: "0 22 * * *"  # JST 7:00（UTC 22:00）
+    - cron: "0 22 * * *"  # JST 7:00
+    - cron: "0 3 * * *"   # JST 12:00
   workflow_dispatch:
 
 jobs:
-  send_line:
+  run:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install dependencies
-      run: |
-        pip install requests
-        pip install yfinance
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
 
-    - name: Run main.py
-      env:
-        LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
-      run: python main.py
+      - name: Run main.py
+        env:
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+        run: python main.py
