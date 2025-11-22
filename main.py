@@ -5,6 +5,10 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
+# ================================
+# 基本設定
+# ================================
+
 UNIVERSE_CSV_PATH = "universe_jpx.csv"
 
 MIN_HISTORY_DAYS = 30
@@ -22,10 +26,16 @@ RISK_SECTORS = [
     "金属製品", "証券、商品先物取引業", "その他金融業"
 ]
 
-def jst_now():
+
+# ================================
+# ユーティリティ
+# ================================
+
+def jst_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=9)))
 
-def safe_float(x):
+
+def safe_float(x) -> float:
     if isinstance(x, pd.Series):
         x = x.iloc[-1]
     try:
@@ -33,16 +43,23 @@ def safe_float(x):
     except Exception:
         return float("nan")
 
-def load_universe():
+
+def load_universe() -> pd.DataFrame:
     df = pd.read_csv(UNIVERSE_CSV_PATH)
     df = df.dropna(subset=["ticker", "name", "sector"])
     df["ticker"] = df["ticker"].astype(str)
     df["sector"] = df["sector"].astype(str)
     return df
 
+
 UNIVERSE = load_universe()
 
-def add_rsi(df, period=14):
+
+# ================================
+# テクニカル指標
+# ================================
+
+def add_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -52,7 +69,8 @@ def add_rsi(df, period=14):
     df["rsi"] = 100 - (100 / (1 + rs))
     return df
 
-def fetch_history(ticker):
+
+def fetch_history(ticker: str) -> pd.DataFrame | None:
     try:
         df = yf.download(
             ticker,
@@ -76,7 +94,8 @@ def fetch_history(ticker):
     df = add_rsi(df)
     return df
 
-def volume_ok(df):
+
+def volume_ok(df: pd.DataFrame) -> bool:
     vol = df["Volume"].fillna(0)
 
     if len(vol) < 20:
@@ -90,12 +109,14 @@ def volume_ok(df):
     avg5 = float(vol.tail(5).mean())
     avg2 = float(vol.tail(2).mean())
 
-    cond1 = avg5 < avg20
-    cond2 = avg2 > avg5
+    # 押し目の理想パターン：静か→少し動きが出る
+    cond1 = avg5 < avg20    # 直近5日で出来高が落ち着いている
+    cond2 = avg2 > avg5     # 足元2日で少し戻っている
 
     return bool(cond1 and cond2)
 
-def is_pullback(df):
+
+def is_pullback(df: pd.DataFrame) -> bool:
     if df is None or len(df) < MIN_HISTORY_DAYS:
         return False
 
@@ -107,7 +128,7 @@ def is_pullback(df):
     if not (np.isfinite(close) and np.isfinite(ma25) and np.isfinite(prev_ma25)):
         return False
 
-    # 25MAより上
+    # 25MAより上（上昇トレンド中）
     if close < ma25:
         return False
 
@@ -115,7 +136,7 @@ def is_pullback(df):
     if ma25 <= prev_ma25:
         return False
 
-    # RSIゾーン
+    # RSIゾーン（押し目）
     rsi = safe_float(last["rsi"])
     if not (RSI_MIN <= rsi <= RSI_MAX):
         return False
@@ -126,7 +147,12 @@ def is_pullback(df):
 
     return True
 
-def calc_in_score(df):
+
+def calc_in_score(df: pd.DataFrame) -> int:
+    """
+    エントリー「しやすさ」を 0〜100点でスコアリング
+    ※この後、地合い・セクターで微調整して Entry Edge にする
+    """
     last = df.iloc[-1]
     rsi = safe_float(last["rsi"])
     close = safe_float(last["close"])
@@ -135,11 +161,12 @@ def calc_in_score(df):
 
     score = 50
 
-    # RSI評価
-    if rsi <= 32:
-        score += 20
-    elif rsi <= 45:
-        score += 10
+    # RSI評価（売られ具合）
+    if np.isfinite(rsi):
+        if rsi <= 32:
+            score += 20
+        elif rsi <= 45:
+            score += 10
 
     # 25MAとの近さ
     if np.isfinite(close) and np.isfinite(ma25) and ma25 != 0:
@@ -156,7 +183,11 @@ def calc_in_score(df):
 
     return int(max(0, min(score, 100)))
 
-def calc_take_profit(df):
+
+def calc_take_profit(df: pd.DataFrame) -> int:
+    """
+    直近高値と10日平均あたりから利確目安をざっくり推定
+    """
     last = safe_float(df.iloc[-1]["close"])
     recent_high = safe_float(df["close"].tail(10).max())
     bb_mid = safe_float(df["ma10"].iloc[-1])
@@ -167,7 +198,11 @@ def calc_take_profit(df):
     tp = (recent_high * 0.6 + bb_mid * 0.4)
     return int(tp)
 
-def calc_stop_loss(df):
+
+def calc_stop_loss(df: pd.DataFrame) -> int:
+    """
+    直近安値・25MA・現在値などから一番守りが固い損切りラインを選ぶ
+    """
     last = safe_float(df.iloc[-1]["close"])
     ma25 = safe_float(df["ma25"].iloc[-1])
     recent_low = safe_float(df["close"].tail(5).min())
@@ -186,11 +221,12 @@ def calc_stop_loss(df):
 
     return int(min(loss_candidates))
 
+
 # ================================
 # マクロ・市場サマリー部分
 # ================================
 
-def fetch_last_and_change(ticker, label, period="5d"):
+def fetch_last_and_change(ticker: str, label: str, period: str = "5d") -> tuple[float, float]:
     """
     指数やETFの直近終値と1日騰落率を取得
     戻り値: (last, chg_pct) どちらか取れなければ (nan, nan)
@@ -218,13 +254,15 @@ def fetch_last_and_change(ticker, label, period="5d"):
     chg = (last / prev - 1.0) * 100.0
     return last, chg
 
-def calc_market_summary():
+
+def calc_market_summary() -> dict:
     """
-    グローバル指標から地合いスコアとサマリー文を生成
+    グローバル指標から地合いスコアと
+    『初心者でも読める短いサマリー文』を生成
     戻り値: dict(score:int, label:str, lines:list[str])
     """
-    lines = []
     score = 50  # ベース
+    lines: list[str] = []
 
     # 米株 ETF を指標として利用
     dia_last, dia_chg = fetch_last_and_change("DIA", "ダウ")
@@ -255,23 +293,14 @@ def calc_market_summary():
     # --- 米株全体の評価 ---
     us_moves = [dia_chg, qqq_chg, iwm_chg, soxx_chg]
     us_valid = [x for x in us_moves if np.isfinite(x)]
+    us_avg = 0.0
     if us_valid:
         us_avg = sum(us_valid) / len(us_valid)
         # ±3% で ±15点くらいのイメージ
         score += max(-15, min(15, us_avg * 5))
-        lines.append(
-            f"- 米株はダウ {dia_chg:+.1f}％ / ナスダック100 {qqq_chg:+.1f}％ / ラッセル2000 {iwm_chg:+.1f}％"
-        )
-        lines.append(
-            f"- 半導体ETF SOXX は {soxx_chg:+.1f}％ で、ハイテク需給は{'改善' if soxx_chg >= 0 else '悪化'}傾向"
-        )
-    else:
-        lines.append("- 米株指標の取得に失敗（中立評価）")
 
     # --- VIX ---
     if np.isfinite(vix_last):
-        lines.append(f"- VIXは {vix_last:.1f} で、ボラティリティ水準は{'低め' if vix_last < 15 else ('やや高め' if vix_last < 25 else '高水準')}")
-
         if vix_last < 15:
             score += 10
         elif vix_last < 20:
@@ -280,68 +309,99 @@ def calc_market_summary():
             score -= 10
         else:
             score -= 20
-    else:
-        lines.append("- VIX取得に失敗（ボラティリティは中立扱い）")
 
     # --- 金利 ---
+    yield10 = np.nan
     if np.isfinite(tnx_last):
         yield10 = tnx_last / 10.0  # ^TNX は10倍表記
-        lines.append(f"- 米10年金利は {yield10:.2f}％ 台で推移（グロースには{'追い風' if yield10 < 4.0 else 'やや逆風'}）")
-
         # ざっくり 4% 以下ならグロースにプラス、5%以上ならマイナス
         if yield10 < 4.0:
             score += 5
         elif yield10 > 5.0:
             score -= 5
-    else:
-        lines.append("- 米10年金利の取得に失敗（金利要因は中立扱い）")
 
     # --- 為替 ---
     if np.isfinite(usdjpy_last) and np.isfinite(usdjpy_chg):
-        lines.append(f"- ドル円は {usdjpy_last:.1f}円（前日比 {usdjpy_chg:+.2f}％）、円安基調で外需に追い風")
-        # 為替の点数は控えめ
         if usdjpy_chg > 0.5:
             score += 2
         elif usdjpy_chg < -0.5:
             score -= 2
-    else:
-        lines.append("- ドル円取得に失敗（為替要因は中立扱い）")
-
-    # --- 欧州・アジア ---
-    asia_eu_lines = []
-    if np.isfinite(vkg_chg):
-        asia_eu_lines.append(f"欧州 {vkg_chg:+.1f}％")
-    if np.isfinite(mchi_chg):
-        asia_eu_lines.append(f"中国 {mchi_chg:+.1f}％")
-    if np.isfinite(ewt_chg):
-        asia_eu_lines.append(f"台湾 {ewt_chg:+.1f}％")
-    if np.isfinite(ewy_chg):
-        asia_eu_lines.append(f"韓国 {ewy_chg:+.1f}％")
-
-    if asia_eu_lines:
-        lines.append("- 欧州・アジア株の動き：" + " / ".join(asia_eu_lines))
-
-    # --- コモディティ ---
-    com_lines = []
-    if np.isfinite(cl_chg):
-        com_lines.append(f"原油 {cl_chg:+.1f}％")
-    if np.isfinite(gc_chg):
-        com_lines.append(f"金 {gc_chg:+.1f}％")
-    if np.isfinite(hg_chg):
-        com_lines.append(f"銅 {hg_chg:+.1f}％")
-    if com_lines:
-        lines.append("- コモディティは " + " / ".join(com_lines))
 
     # スコアを 0〜100 にクリップ
     score = int(max(0, min(100, score)))
 
     # ラベル
-    if score >= 60:
-        label = "強め"
+    if score >= 70:
+        label = "強い（リスクオン寄り）"
+    elif score >= 60:
+        label = "やや強い"
     elif score >= 45:
-        label = "中立〜やや弱め"
+        label = "中立"
+    elif score >= 30:
+        label = "やや弱い"
     else:
-        label = "弱い（調整局面）"
+        label = "弱い（調整モード）"
+
+    # ============================
+    # ここから「初心者向け・短いサマリー」を組み立てる
+    # ============================
+
+    # 1行目：米国株
+    if np.isfinite(dia_chg) and np.isfinite(qqq_chg):
+        if us_avg > 0.5:
+            us_word = "強い上昇"
+        elif us_avg > 0:
+            us_word = "やや上昇"
+        elif us_avg > -0.5:
+            us_word = "小幅安"
+        else:
+            us_word = "弱い下げ"
+        lines.append(
+            f"- 米国株：ダウ {dia_chg:+.1f}% / ナスダック {qqq_chg:+.1f}% → 全体としては{us_word}"
+        )
+    else:
+        lines.append("- 米国株：データ取得失敗（中立扱い）")
+
+    # 2行目：半導体
+    if np.isfinite(soxx_chg):
+        sox_word = "追い風" if soxx_chg >= 0 else "逆風"
+        lines.append(
+            f"- 半導体ETF（SOXX）：{soxx_chg:+.1f}% → 日本のハイテクには{sox_word}"
+        )
+    else:
+        lines.append("- 半導体ETF：データ取得失敗（影響は中立扱い）")
+
+    # 3行目：金利
+    if np.isfinite(yield10):
+        gl_word = "プラス" if yield10 < 4.0 else ("やや逆風" if yield10 < 5.0 else "逆風")
+        lines.append(
+            f"- 米10年金利：{yield10:.2f}% → グロース株には{gl_word}"
+        )
+    else:
+        lines.append("- 米10年金利：データ取得失敗（金利要因は中立扱い）")
+
+    # 4行目：為替
+    if np.isfinite(usdjpy_last) and np.isfinite(usdjpy_chg):
+        fx_word = "外需に追い風" if usdjpy_chg >= 0 else "外需にはやや向かい風"
+        lines.append(
+            f"- 為替（ドル円）：{usdjpy_last:.1f}円（前日比 {usdjpy_chg:+.2f}%）→ {fx_word}"
+        )
+    else:
+        lines.append("- 為替：データ取得失敗（中立扱い）")
+
+    # 5行目：世界株ざっくり
+    sub_parts = []
+    if np.isfinite(vkg_chg):
+        sub_parts.append(f"欧州 {vkg_chg:+.1f}%")
+    if np.isfinite(mchi_chg):
+        sub_parts.append(f"中国 {mchi_chg:+.1f}%")
+    if np.isfinite(ewt_chg):
+        sub_parts.append(f"台湾 {ewt_chg:+.1f}%")
+    if np.isfinite(ewy_chg):
+        sub_parts.append(f"韓国 {ewy_chg:+.1f}%")
+
+    if sub_parts:
+        lines.append("- 世界株： " + " / ".join(sub_parts))
 
     # 最後に一文まとめ
     lines.append(f"→ 今日の地合いスコア：{score}点（{label}）")
@@ -352,9 +412,10 @@ def calc_market_summary():
         "lines": lines
     }
 
-def adjust_score_by_market(base_score, sector, market_score):
+
+def adjust_score_by_market(base_score: int, sector: str, market_score: int) -> int:
     """
-    地合いスコアとセクターに応じて INスコアを微調整
+    地合いスコアとセクターに応じて Entry Edge を微調整
     """
     score = base_score
 
@@ -373,8 +434,9 @@ def adjust_score_by_market(base_score, sector, market_score):
 
     return int(max(0, min(100, score)))
 
-def pick_top5(market_score):
-    rows = []
+
+def pick_top5(market_score: int) -> list[dict]:
+    rows: list[dict] = []
 
     for _, row in UNIVERSE.iterrows():
         ticker = row["ticker"]
@@ -399,28 +461,28 @@ def pick_top5(market_score):
             continue
         lower = int(min(lower_candidates))
 
-        reasons = []
+        reasons: list[str] = []
         if np.isfinite(rsi):
             if rsi <= 32:
-                reasons.append("売られすぎの強い押し目")
+                reasons.append("売られすぎ気味の強い押し目")
             elif rsi <= 45:
-                reasons.append("理想的な押し目")
+                reasons.append("理想的な押し目ゾーン")
             else:
-                reasons.append("軽めの押し目")
+                reasons.append("浅めの押し目")
 
         ma25 = safe_float(last["ma25"])
         if np.isfinite(ma25) and ma25 != 0:
             dist25 = abs(price - ma25) / ma25
             if dist25 < 0.01:
-                reasons.append("25MAタッチ")
+                reasons.append("25日線タッチ")
             elif dist25 < 0.02:
-                reasons.append("25MA近辺の押し目")
+                reasons.append("25日線近辺の押し目")
 
         if volume_ok(df):
-            reasons.append("出来高が減→増へ転換")
+            reasons.append("出来高が減少→直近でやや回復")
 
         base_score = calc_in_score(df)
-        in_score = adjust_score_by_market(base_score, sector, market_score)
+        entry_edge = adjust_score_by_market(base_score, sector, market_score)
         tp = calc_take_profit(df)
         sl = calc_stop_loss(df)
 
@@ -432,7 +494,7 @@ def pick_top5(market_score):
             "lower": lower,
             "rsi": rsi,
             "reason": " / ".join(reasons),
-            "score": in_score,
+            "entry_edge": entry_edge,
             "tp": tp,
             "sl": sl
         })
@@ -440,54 +502,65 @@ def pick_top5(market_score):
     if not rows:
         return []
 
-    df = pd.DataFrame(rows).sort_values("score", ascending=False).head(5)
+    df = pd.DataFrame(rows).sort_values("entry_edge", ascending=False).head(5)
     return df.to_dict("records")
 
-def build_message():
+
+# ================================
+# メッセージ生成 & LINE送信
+# ================================
+
+def build_message() -> str:
     now_str = jst_now().strftime("%Y-%m-%d")
 
     # 1. 市場サマリー
     market = calc_market_summary()
     score = market["score"]
-    label = market["label"]
     summary_lines = market["lines"]
 
     # 2. 本命TOP5（地合いスコア連動）
     cands = pick_top5(score)
 
     if not cands:
-        body = f"📉 {now_str}\n本日の本命TOP5銘柄はありません。"
-    else:
-        lines = []
-        # 市場サマリー
-        lines.append("📊 今日の市場サマリー（プロ分析）")
-        lines.extend(summary_lines)
-        lines.append("")  # 空行
-        # 個別銘柄
-        lines.append(f"📈 {now_str} 本日の本命TOP5\n")
+        body = f"📉 {now_str}\n本日の本命Entry銘柄TOP5は条件に合致するものがありませんでした。"
+        return body
 
-        for i, r in enumerate(cands, 1):
-            lines.append(f"{i}. {r['ticker']}（{r['name']}）")
-            lines.append(f"   IN確率: {r['score']}点")
-            lines.append(f"   買い目安: {r['lower']}円（現在 {int(r['price'])}円）")
-            lines.append(f"   利確目安: {r['tp']}円")
-            lines.append(f"   損切り: {r['sl']}円")
-            lines.append(f"   理由: {r['reason']}\n")
+    lines: list[str] = []
 
-        # まとめ
-        lines.append("【まとめ】")
-        for r in cands:
-            lines.append(f"{r['ticker']}（{r['name']}）: IN確率 {r['score']}点")
+    # 市場サマリー
+    lines.append("📊 今日の市場サマリー（初心者向け）")
+    lines.extend(summary_lines)
+    lines.append("")  # 空行
 
-        body = "\n".join(lines)
+    # 個別銘柄
+    lines.append(f"📈 {now_str} 本日の本命TOP5（押し目スイング候補）\n")
 
+    for i, r in enumerate(cands, 1):
+        lines.append(f"{i}. {r['ticker']}（{r['name']}）")
+        lines.append(f"   Entry Edge（エントリー優位度）: {r['entry_edge']} / 100")
+        lines.append(f"   買い目安: {r['lower']}円（現在値 約{int(r['price'])}円）")
+        lines.append(f"   利確目安: {r['tp']}円")
+        lines.append(f"   損切り目安: {r['sl']}円")
+        if r["reason"]:
+            lines.append(f"   根拠: {r['reason']}")
+        lines.append("")  # 銘柄ごとに空行
+
+    # まとめ
+    lines.append("【まとめ：Entry Edgeランキング】")
+    for r in cands:
+        lines.append(f"- {r['ticker']}（{r['name']}）: Entry Edge {r['entry_edge']} / 100")
+
+    body = "\n".join(lines)
     return body
 
-def send_line(message):
+
+def send_line(message: str) -> None:
     token = os.getenv("LINE_TOKEN")
     if not token:
-        print("LINE_TOKENが設定されていません")
+        print("LINE_TOKENが設定されていません。以下のメッセージが本来送信されます：")
+        print("------")
         print(message)
+        print("------")
         return
 
     url = "https://api.line.me/v2/bot/message/broadcast"
@@ -505,10 +578,18 @@ def send_line(message):
     except Exception as e:
         print("LINE送信エラー:", e)
 
-def main():
+
+def main() -> None:
+    """
+    1. グローバル地合いをスコアリング
+    2. 日本株ユニバースから押し目候補を抽出
+    3. Entry EdgeでTOP5をランキング
+    4. LINEにサマリー＋銘柄リストを送信
+    """
     msg = build_message()
     print(msg)  # ログ確認用
     send_line(msg)
+
 
 if __name__ == "__main__":
     main()
