@@ -2,8 +2,7 @@ name: stockbot
 
 on:
   schedule:
-    # 毎日 22:58 UTC → 日本時間 7:58 に実行開始（混雑回避）
-    - cron: "58 22 * * *"
+    - cron: "0 23 * * *"  # 8:00 JST
   workflow_dispatch:
 
 jobs:
@@ -11,41 +10,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
 
-      # ここで 8:00 JST まで待機
-      - name: Wait until 8:00 JST
-        run: |
-          python - << 'EOF'
-          import time
-          from datetime import datetime, timedelta, timezone
-
-          JST = timezone(timedelta(hours=9))
-
-          now = datetime.now(JST)
-          target = now.replace(hour=8, minute=0, second=0, microsecond=0)
-
-          if now > target:
-              target += timedelta(days=1)
-
-          wait = (target - now).total_seconds()
-          print(f"Waiting {wait:.1f} seconds until 8:00 JST...")
-          time.sleep(wait)
-          EOF
-
-      - name: Run stockbot and send to LINE
-        env:
-          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
-        run: |
-          python main.py
+    - name: Run stockbot and send to LINE
+      env:
+        LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+      run: python main.py
