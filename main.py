@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 # ==========================================
 
 UNIVERSE_CSV_PATH = "universe_jpx.csv"
+EARNINGS_CSV_PATH = "earnings_jpx.csv"
+CREDIT_CSV_PATH = "credit_jpx.csv"
 
 # ヒストリカル取得日数
 HISTORY_PERIOD = "6mo"
@@ -68,7 +70,34 @@ def load_universe() -> pd.DataFrame:
     df["sector"] = df["sector"].astype(str)
     return df
 
+def load_earnings() -> pd.DataFrame:
+    if not os.path.exists(EARNINGS_CSV_PATH):
+        print("WARN: earnings_jpx.csv が見つからないため、決算フィルターは無効（全通し）")
+        return pd.DataFrame(columns=["ticker", "earnings_date"])
+    df = pd.read_csv(EARNINGS_CSV_PATH)
+    df["ticker"] = df["ticker"].astype(str)
+    if "earnings_date" in df.columns:
+        df["earnings_date"] = pd.to_datetime(df["earnings_date"], errors="coerce").dt.date
+    else:
+        df["earnings_date"] = pd.NaT
+    return df
+
+def load_credit() -> pd.DataFrame:
+    if not os.path.exists(CREDIT_CSV_PATH):
+        print("WARN: credit_jpx.csv が見つからないため、信用残フィルターは無効（全通し）")
+        return pd.DataFrame(columns=["ticker", "margin_ratio", "margin_buy", "margin_sell"])
+    df = pd.read_csv(CREDIT_CSV_PATH)
+    df["ticker"] = df["ticker"].astype(str)
+    for col in ["margin_ratio", "margin_buy", "margin_sell"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
+    return df
+
 UNIVERSE = load_universe()
+EARNINGS_DF = load_earnings()
+CREDIT_DF = load_credit()
 
 # ==========================================
 # テクニカル指標
@@ -124,7 +153,7 @@ def fetch_history(ticker: str) -> pd.DataFrame | None:
         return None
     if df is None or df.empty:
         return None
-    df = df.tail(120)  # 余裕を持たせておく
+    df = df.tail(120)
     if len(df) < MIN_HISTORY_DAYS:
         return None
     df = enrich_technicals(df)
@@ -135,7 +164,6 @@ def fetch_history(ticker: str) -> pd.DataFrame | None:
 # ==========================================
 
 def passes_liquidity(df: pd.DataFrame) -> bool:
-    """平均売買代金フィルター"""
     recent = df.tail(20)
     avg_turnover = safe_float(recent["turnover"].mean())
     if not np.isfinite(avg_turnover):
@@ -143,7 +171,6 @@ def passes_liquidity(df: pd.DataFrame) -> bool:
     return avg_turnover >= MIN_AVG_TURNOVER
 
 def passes_volatility(df: pd.DataFrame) -> bool:
-    """ATRベースのボラティリティ制御"""
     recent = df.tail(60).copy()
     if recent["atr"].isna().all():
         return False
@@ -164,7 +191,6 @@ def passes_volatility(df: pd.DataFrame) -> bool:
     return True
 
 def passes_trend(df: pd.DataFrame) -> bool:
-    """MA10 >= MA25 >= MA75 & close >= MA75"""
     last = df.iloc[-1]
     ma10 = safe_float(last["ma10"])
     ma25 = safe_float(last["ma25"])
@@ -183,17 +209,56 @@ def passes_trend(df: pd.DataFrame) -> bool:
 
 def passes_event_risk(ticker: str, df: pd.DataFrame) -> bool:
     """
-    決算 ±3日 などを本来はここで除外する。
-    今は外部データがないため True を返すスタブ。
-    必要なら自前で決算カレンダーAPIを叩いて組み込め。
+    決算日 ±3営業日を除外。
+    earnings_jpx.csv にない銘柄はスルー。
     """
+    if EARNINGS_DF.empty:
+        return True
+
+    sub = EARNINGS_DF[EARNINGS_DF["ticker"] == ticker]
+    if sub.empty:
+        return True
+
+    earnings_date = sub["earnings_date"].iloc[0]
+    if pd.isna(earnings_date):
+        return True
+
+    # df の最終日（直近営業日）
+    last_date = df.index[-1].date()
+    diff = (earnings_date - last_date).days
+    # 決算 ±3日 は除外
+    if -3 <= diff <= 3:
+        return False
+
     return True
 
-def passes_credit_risk(ticker: str) -> bool:
+def passes_credit_risk(ticker: str, df: pd.DataFrame) -> bool:
     """
-    信用残・信用倍率などで本来フィルタする。
-    現状はデータソースがないため常に True。
+    信用倍率・信用買残の重さから危険銘柄を除外
+    条件：
+      - 信用倍率 <= 5
+      - 信用買残 / 直近1週間出来高 <= 20
     """
+    if CREDIT_DF.empty:
+        return True
+
+    sub = CREDIT_DF[CREDIT_DF["ticker"] == ticker]
+    if sub.empty:
+        return True
+
+    row = sub.iloc[0]
+    margin_ratio = safe_float(row.get("margin_ratio", np.nan))
+    margin_buy = safe_float(row.get("margin_buy", np.nan))
+
+    if np.isfinite(margin_ratio) and margin_ratio > 5.0:
+        return False
+
+    vol_week = safe_float(df["Volume"].tail(5).sum())
+    if np.isfinite(margin_buy) and np.isfinite(vol_week) and vol_week > 0:
+        buy_vs_vol = margin_buy / vol_week
+        if buy_vs_vol > 20.0:
+            return False
+
     return True
 
 # ==========================================
@@ -216,10 +281,8 @@ def analyze_volume_state(df: pd.DataFrame) -> dict:
     v30 = safe_float(vol.tail(30).mean())
     last = safe_float(vol.iloc[-1])
 
-    # 減 → 増 の基本パターン
     cond_cycle = v20 > v10 > v5 and last2 > v5
 
-    # 異常系
     soldout = np.isfinite(v30) and last < v30 * VOLUME_SOLDOUT_RATIO
     spike = np.isfinite(v30) and last > v30 * VOLUME_SPIKE_RATIO
 
@@ -242,19 +305,16 @@ def is_deep_pullback(df: pd.DataFrame) -> bool:
     if not all(np.isfinite(v) for v in [close, ma25, rsi]):
         return False
 
-    # 25MA 付近
     dist = abs(close - ma25) / ma25 if ma25 != 0 else np.inf
     if dist > MA_TOL:
         return False
 
-    # RSI は深押しゾーン
     if not (RSI_MIN <= rsi <= RSI_MAX):
         return False
 
     return True
 
 def analyze_candle(df: pd.DataFrame) -> dict:
-    """下ヒゲなどローソク足の形状をざっくり判定"""
     last = df.iloc[-1]
     o = safe_float(last["Open"])
     h = safe_float(last["High"])
@@ -267,7 +327,6 @@ def analyze_candle(df: pd.DataFrame) -> dict:
 
     long_lower = False
     if np.isfinite(range_) and range_ > 0 and np.isfinite(lower_shadow) and np.isfinite(body):
-        # 下ヒゲが全体の 35% 以上 & 実体より長い → それなりの反転シグナル
         if (lower_shadow / range_ > 0.35) and (lower_shadow > body):
             long_lower = True
 
@@ -276,10 +335,6 @@ def analyze_candle(df: pd.DataFrame) -> dict:
     }
 
 def calc_entry_edge(df: pd.DataFrame, volume_state: dict, candle: dict) -> tuple[int, list[str]]:
-    """
-    Entry Edge を 0〜100 点でスコアリング
-    返り値: (score, reasons[list[str]])
-    """
     last = df.iloc[-1]
     close = safe_float(last["close"])
     ma25 = safe_float(last["ma25"])
@@ -288,12 +343,10 @@ def calc_entry_edge(df: pd.DataFrame, volume_state: dict, candle: dict) -> tuple
     score = 0
     reasons = []
 
-    # トレンド（passes_trend を通っている前提だが、念のため）
     if passes_trend(df):
         score += 20
         reasons.append("上昇トレンド継続（10MA≥25MA≥75MA）")
 
-    # 25MA 距離
     if np.isfinite(close) and np.isfinite(ma25) and ma25 > 0:
         dist = abs(close - ma25) / ma25
         if dist <= 0.005:
@@ -306,7 +359,6 @@ def calc_entry_edge(df: pd.DataFrame, volume_state: dict, candle: dict) -> tuple
             score += 5
             reasons.append("25MA圏内")
 
-    # RSI
     if np.isfinite(rsi):
         if RSI_MIN <= rsi <= 32:
             score += 25
@@ -315,7 +367,6 @@ def calc_entry_edge(df: pd.DataFrame, volume_state: dict, candle: dict) -> tuple
             score += 15
             reasons.append("RSI押し目ゾーン")
 
-    # 出来高サイクル
     if volume_state["ok"]:
         score += 20
         reasons.append("出来高 減→増 の反転傾向")
@@ -326,7 +377,6 @@ def calc_entry_edge(df: pd.DataFrame, volume_state: dict, candle: dict) -> tuple
         score -= 20
         reasons.append("出来高スパイク（ニュース系リスク）")
 
-    # ローソク足
     if candle["long_lower"]:
         score += 10
         reasons.append("下ヒゲ反転気味")
@@ -363,18 +413,8 @@ def fetch_last_and_change(ticker: str, period: str = "5d") -> tuple[float, float
     return last, chg
 
 def calc_market_summary() -> dict:
-    """
-    グローバル指標から地合いスコアとサマリー文を生成。
-    戻り値:
-      {
-        "score": int,
-        "label": str,
-        "lines": list[str],
-        "regime": str  # "risk_on" / "neutral" / "risk_off"
-      }
-    """
     lines = []
-    score = 50  # ベース
+    score = 50
 
     dia_last, dia_chg = fetch_last_and_change("DIA")
     qqq_last, qqq_chg = fetch_last_and_change("QQQ")
@@ -382,7 +422,7 @@ def calc_market_summary() -> dict:
     soxx_last, soxx_chg = fetch_last_and_change("SOXX")
 
     vix_last, vix_chg = fetch_last_and_change("^VIX")
-    tnx_last, tnx_chg = fetch_last_and_change("^TNX")  # ×10 表記
+    tnx_last, tnx_chg = fetch_last_and_change("^TNX")
     usdjpy_last, usdjpy_chg = fetch_last_and_change("JPY=X")
 
     vkg_last, vkg_chg = fetch_last_and_change("VGK")
@@ -390,7 +430,6 @@ def calc_market_summary() -> dict:
     ewt_last, ewt_chg = fetch_last_and_change("EWT")
     ewy_last, ewy_chg = fetch_last_and_change("EWY")
 
-    # 米株
     us_moves = [dia_chg, qqq_chg, iwm_chg, soxx_chg]
     us_valid = [x for x in us_moves if np.isfinite(x)]
     if us_valid:
@@ -402,7 +441,6 @@ def calc_market_summary() -> dict:
     else:
         lines.append("- 米株指標の取得に失敗（中立扱い）")
 
-    # VIX
     if np.isfinite(vix_last):
         if vix_last < 15:
             score += 10
@@ -419,7 +457,6 @@ def calc_market_summary() -> dict:
     else:
         lines.append("- VIX取得に失敗（ボラ要因は中立扱い）")
 
-    # 金利
     if np.isfinite(tnx_last):
         y10 = tnx_last / 10.0
         if y10 < 4.0:
@@ -434,13 +471,11 @@ def calc_market_summary() -> dict:
     else:
         lines.append("- 米10年金利取得に失敗（金利要因は中立）")
 
-    # 為替
     if np.isfinite(usdjpy_last) and np.isfinite(usdjpy_chg):
         lines.append(
-            f"- ドル円 {usdjpy_last:.1f}円（{usdjpy_chg:+.2f}％）、外需/輸出に{ '追い風' if usdjpy_chg > 0 else '逆風気味' }"
+            f"- ドル円 {usdjpy_last:.1f}円（{usdjpy_chg:+.2f}％）、外需/輸出に{'追い風' if usdjpy_chg > 0 else '逆風気味'}"
         )
 
-    # 欧州・アジア
     asia_eu = []
     if np.isfinite(vkg_chg):
         asia_eu.append(f"欧州 {vkg_chg:+.1f}％")
@@ -475,11 +510,7 @@ def calc_market_summary() -> dict:
     }
 
 def calc_theme_score(sector: str, market: dict) -> int:
-    """
-    セクター × 地合い からテーマ強度をざっくり評価（0〜100）
-    """
     base = 50
-    score = market["score"]
     regime = market["regime"]
 
     if sector in RISK_SECTORS:
@@ -497,9 +528,6 @@ def calc_theme_score(sector: str, market: dict) -> int:
     return base
 
 def calc_market_fit(sector: str, market: dict) -> int:
-    """
-    地合いとセクターの相性を 0〜100 でスコア
-    """
     regime = market["regime"]
     if regime == "risk_on":
         if sector in RISK_SECTORS:
@@ -513,7 +541,7 @@ def calc_market_fit(sector: str, market: dict) -> int:
         if sector in RISK_SECTORS:
             return 40
         return 50
-    else:  # neutral
+    else:
         if sector in DEFENSIVE_SECTORS:
             return 60
         if sector in RISK_SECTORS:
@@ -521,15 +549,7 @@ def calc_market_fit(sector: str, market: dict) -> int:
         return 55
 
 def decide_risk_regime_action(market: dict) -> dict:
-    """
-    リスクレジームに応じて：
-      - レバ上限
-      - 最大ポジ数
-      - 一言コメント
-    を返す
-    """
     regime = market["regime"]
-    score = market["score"]
 
     if regime == "risk_off":
         return {
@@ -558,10 +578,6 @@ def decide_risk_regime_action(market: dict) -> dict:
 # ==========================================
 
 def classify_core_watch(entry_edge: int, hard_pass: bool) -> str | None:
-    """
-    Entry Edge とハードフィルタ結果から
-    "core" / "watch" / None を返す
-    """
     if not hard_pass:
         return None
 
@@ -572,10 +588,6 @@ def classify_core_watch(entry_edge: int, hard_pass: bool) -> str | None:
     return None
 
 def calc_final_rank(entry_edge: int, theme_score: int, market_fit: int) -> float:
-    """
-    最終順位用の複合スコア
-    FinalRank = EntryEdge*0.55 + Theme*0.30 + MarketFit*0.15
-    """
     return entry_edge * 0.55 + theme_score * 0.30 + market_fit * 0.15
 
 def calc_take_profit(df: pd.DataFrame) -> int:
@@ -620,7 +632,6 @@ def screen_candidates(market: dict) -> tuple[list[dict], list[dict]]:
         if df is None:
             continue
 
-        # ハードフィルター
         if not passes_liquidity(df):
             continue
         if not passes_volatility(df):
@@ -631,20 +642,19 @@ def screen_candidates(market: dict) -> tuple[list[dict], list[dict]]:
             continue
         if not passes_event_risk(ticker, df):
             continue
-        if not passes_credit_risk(ticker):
+        if not passes_credit_risk(ticker, df):
             continue
 
         volume_state = analyze_volume_state(df)
         candle = analyze_candle(df)
         entry_edge, reasons_edge = calc_entry_edge(df, volume_state, candle)
 
-        hard_pass = True  # ここまで来てる時点でハード条件はクリア
+        hard_pass = True
 
         class_type = classify_core_watch(entry_edge, hard_pass)
         if class_type is None:
             continue
 
-        # テーマ・地合い関連
         theme_score = calc_theme_score(sector, market)
         market_fit = calc_market_fit(sector, market)
         final_rank = calc_final_rank(entry_edge, theme_score, market_fit)
@@ -678,7 +688,7 @@ def screen_candidates(market: dict) -> tuple[list[dict], list[dict]]:
             "ticker": ticker,
             "name": name,
             "sector": sector,
-            "class": class_type,  # "core" or "watch"
+            "class": class_type,
             "entry_edge": entry_edge,
             "theme_score": theme_score,
             "market_fit": market_fit,
@@ -696,13 +706,8 @@ def screen_candidates(market: dict) -> tuple[list[dict], list[dict]]:
         else:
             watch_rows.append(rec)
 
-    # 順位付け
-    core_rows = sorted(core_rows, key=lambda x: x["final_rank"], reverse=True)
-    watch_rows = sorted(watch_rows, key=lambda x: x["final_rank"], reverse=True)
-
-    # 本命 2〜4、注目 2〜5 に絞る
-    core_rows = core_rows[:4]
-    watch_rows = watch_rows[:5]
+    core_rows = sorted(core_rows, key=lambda x: x["final_rank"], reverse=True)[:4]
+    watch_rows = sorted(watch_rows, key=lambda x: x["final_rank"], reverse=True)[:5]
 
     return core_rows, watch_rows
 
@@ -719,7 +724,6 @@ def build_message() -> str:
 
     lines: list[str] = []
 
-    # ① 今日の結論
     lines.append(f"📅 {today} stockbot TOM 戦略レポート")
     lines.append("")
     lines.append("◆ 今日の結論")
@@ -732,12 +736,10 @@ def build_message() -> str:
     lines.append(f"- 戦略コメント: {risk_cfg['comment']}")
     lines.append("")
 
-    # ② マクロ・サマリー
     lines.append("◆ マクロ・地合いサマリー")
     lines.extend(market["lines"])
     lines.append("")
 
-    # ③ 戦略オーダー（シンプルに固定）
     lines.append("◆ 今日の戦い方（スイング視点）")
     if market["regime"] == "risk_off":
         lines.append("- 原則守り。新規スイングは「本命」でもサイズは半分以下。")
@@ -750,46 +752,34 @@ def build_message() -> str:
         lines.append("- 押し目以外（高値追い・逆張り）はスルー推奨。")
     lines.append("")
 
-    # ④ 本命銘柄
     if core:
         lines.append("◆ 本命（Core）候補")
         for i, r in enumerate(core, 1):
-            lines.append(
-                f"{i}. {r['ticker']}（{r['name']} / {r['sector']}）"
-            )
-            lines.append(
-                f"   Entry Edge: {r['entry_edge']} / 100"
-            )
+            lines.append(f"{i}. {r['ticker']}（{r['name']} / {r['sector']}）")
+            lines.append(f"   Entry Edge: {r['entry_edge']} / 100")
             lines.append(
                 f"   買いゾーン: {r['buy_low']}〜{r['buy_high']}円（現在 {r['price']}円）"
             )
-            lines.append(
-                f"   利確目安: {r['tp']}円 / 損切り目安: {r['sl']}円"
-            )
+            lines.append(f"   利確目安: {r['tp']}円 / 損切り目安: {r['sl']}円")
             lines.append(
                 f"   テーマ・地合い適合: Theme {r['theme_score']} / MarketFit {r['market_fit']}"
             )
-            lines.append(
-                f"   コメント: {r['reasons']}"
-            )
+            lines.append(f"   コメント: {r['reasons']}")
             lines.append("")
     else:
         lines.append("◆ 本命（Core）候補")
         lines.append("- 条件を満たす本命押し目は本日なし。無理にポジションを取りに行かない方が合理的。")
         lines.append("")
 
-    # ⑤ 注目銘柄
     if watch:
         lines.append("◆ 注目（Watch）候補")
         for i, r in enumerate(watch, 1):
-            lines.append(
-                f"{i}. {r['ticker']}（{r['name']} / {r['sector']}）"
-            )
+            lines.append(f"{i}. {r['ticker']}（{r['name']} / {r['sector']}）")
             lines.append(
                 f"   Entry Edge: {r['entry_edge']} / テーマ: {r['theme_score']} / MarketFit: {r['market_fit']}"
             )
             lines.append(
-                f"   状況: 押し目仕上がり途中の候補。板・寄り付きの動き次第で本命化を検討。"
+                "   状況: 押し目仕上がり途中の候補。板・寄り付きの動き次第で本命化を検討。"
             )
             lines.append("")
     else:
@@ -797,7 +787,6 @@ def build_message() -> str:
         lines.append("- 本日時点で“仕上がり途中”の押し目候補も少数。様子見優位の地合い。")
         lines.append("")
 
-    # ⑥ ショートまとめ
     lines.append("◆ まとめ")
     if core:
         core_tick = ", ".join([f"{r['ticker']}({r['entry_edge']}点)" for r in core])
